@@ -18,7 +18,6 @@ export default function Header() {
   const [selectedTheme, setSelectedTheme] = useState(StorageUtils.getTheme());
   const { setShowSettings } = useAppContext();
 
-  // model state lives here (single place)
   const [models, setModels] = useState<ApiModel[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>(
     localStorage.getItem(SELECTED_MODEL_KEY) || ''
@@ -38,8 +37,7 @@ export default function Header() {
     );
   }, [selectedTheme]);
 
-  // inside Header.tsx
-
+  // fetch models once
   // fetch models once
   useEffect(() => {
     let cancelled = false;
@@ -49,22 +47,13 @@ export default function Header() {
         if (!resp.ok) throw new Error(`Failed to fetch models: ${resp.status}`);
         const raw = await resp.json();
 
-        // Normalize into ApiModel[]
         let arr: ApiModel[] = [];
-        if (Array.isArray(raw)) {
-          arr = raw;
-        } else if (raw && Array.isArray(raw.data)) {
-          // OpenAI-style format
+        if (raw && Array.isArray(raw.data)) {
           arr = raw.data.map((m: any) => ({
-            name: m.id,
-            display_name: m.id,
-            type: 'openai',
+            name: m.name,
+            display_name: m.display_name || m.name,
+            type: m.type || 'openai',
           }));
-        } else if (raw && Array.isArray(raw.models)) {
-          // our /props-style
-          arr = raw.models as ApiModel[];
-        } else {
-          throw new Error('Unrecognized models payload');
         }
 
         if (cancelled) return;
@@ -90,7 +79,6 @@ export default function Header() {
   const handleChangeModel = (name: string) => {
     setSelectedModel(name);
     localStorage.setItem(SELECTED_MODEL_KEY, name);
-    // fire a global event so other components can react if needed
     window.dispatchEvent(
       new CustomEvent('warriorgpt:model-changed', { detail: name })
     );
@@ -108,9 +96,12 @@ export default function Header() {
       </label>
 
       {/* App title */}
-      <div className="grow text-2xl font-bold ml-2">🪓 WarriorGPT</div>
+      <div className="grow flex items-center text-2xl font-bold ml-2">
+        <img src="/wgpt-logo.png" alt="Logo" className="h-28 w-auto mr-3" />
+        <span>WarriorGPT</span>
+      </div>
 
-      {/* Model selector (right side) */}
+      {/* Model selector */}
       <div className="mr-3 hidden sm:flex items-center gap-2">
         <span className="text-sm opacity-70">Model</span>
         <select
@@ -127,7 +118,7 @@ export default function Header() {
         </select>
       </div>
 
-      {/* action buttons (top right) */}
+      {/* action buttons */}
       <div className="flex items-center">
         <div
           className="tooltip tooltip-bottom"
@@ -135,7 +126,6 @@ export default function Header() {
           onClick={() => setShowSettings(true)}
         >
           <button className="btn" aria-hidden={true}>
-            {/* settings button */}
             <Cog8ToothIcon className="w-5 h-5" />
           </button>
         </div>

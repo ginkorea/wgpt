@@ -134,5 +134,5 @@ export interface LlamaCppServerProps {
     vision: boolean;
     audio: boolean;
   };
-  // TODO: support params
+  display_name?: string; // 👈 add this
 }

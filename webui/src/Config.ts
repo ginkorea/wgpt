@@ -104,7 +104,7 @@ export const THEMES = ['light', 'dark'].concat(
 export type AppConfig = typeof CONFIG_DEFAULT;
 
 // ——— Extras that some components expect (harmless to include) ———
-export const MODELS_ENDPOINT = `${BASE_URL}/v1/models`;
+export const MODELS_ENDPOINT = `http://localhost:5000/w/models`;
 export const CHAT_ENDPOINT = `${BASE_URL}/v1/chat/completions`;
 
 // Keep labels as plain strings in SettingDialog; ensure these are strings, not symbols

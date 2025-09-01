@@ -4,23 +4,29 @@ main.py - Start llama-server(s) and the WebUI (Vite Preview)
 - Loads models from models/models.yaml
 - Spawns llama-server instances (ports per runtime section; recommend 8081+)
 - Launches `npm run preview -- --port 8080` to serve built UI
+- Exposes /props for frontend config
 - Cleans up on shutdown
 """
 
-import os
+import requests
 import sys
 import yaml
 import signal
 import subprocess
 from pathlib import Path
+from flask import Flask, jsonify
+from flask_cors import CORS
 
 ROOT_DIR = Path(__file__).parent.resolve()
 MODELS_YAML = ROOT_DIR / "models" / "models.yaml"
 WEBUI_DIR = ROOT_DIR / "webui"
+WEBUI_DIST = WEBUI_DIR / "dist"
 
 procs = {}
+models = {}
 
 def load_models():
+    global models
     if not MODELS_YAML.exists():
         print(f"[ERROR] {MODELS_YAML} not found")
         sys.exit(1)
@@ -29,7 +35,8 @@ def load_models():
     if not isinstance(data, dict) or "models" not in data:
         print("[ERROR] models.yaml must contain a 'models:' key")
         sys.exit(1)
-    return data["models"]
+    models = data["models"]
+    return models
 
 def start_model_server(name, cfg):
     runtime = cfg.get("runtime", {})
@@ -76,21 +83,44 @@ def handle_signal(sig, frame):
     stop_all()
     sys.exit(0)
 
+# ----------------------
+# Flask app for /props
+# ----------------------
+app = Flask(__name__, static_folder=str(WEBUI_DIST), static_url_path="")
+CORS(app, resources={r"/w/*": {"origins": "*"}})
+
+@app.route("/w/models", methods=["GET"])
+def wgpt_models():
+    """
+    Return enriched models list based on models.yaml
+    This avoids clashing with llama-server's /v1/models
+    """
+    enriched = []
+    for name, cfg in models.items():
+        enriched.append({
+            "id": name,  # short stable id
+            "name": name,
+            "display_name": cfg.get("display_name", Path(name).stem),
+            "type": cfg.get("type", "llama"),
+            "runtime": cfg.get("runtime", {}),
+        })
+    return {"object": "list", "data": enriched}
+
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     models = load_models()
 
-    # 1) Start all model servers
+    # Start llama-server(s)
     for name, cfg in models.items():
         start_model_server(name, cfg)
 
-    # 2) Build UI (skip if already built)
-    # You can uncomment this if you want `main.py` to build for you:
-    # subprocess.run(["npm", "run", "build"], cwd=WEBUI_DIR, check=True)
+    # Start WebUI + Flask props on port 5000
+    from threading import Thread
+    Thread(target=lambda: app.run(port=5000, host="0.0.0.0", debug=False, use_reloader=False)).start()
 
-    # 3) Start Vite Preview on 8080 (serves `webui/dist`)
+    # Start Vite Preview
     webui_proc = start_webui_preview()
     try:
         webui_proc.wait()

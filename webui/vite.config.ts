@@ -35,12 +35,12 @@ const BUILD_PLUGINS = [
         const outputIndexHtml = path.join(config.build.outDir, 'index.html');
         let content =
           GUIDE_FOR_FRONTEND + '\n' + fs.readFileSync(outputIndexHtml, 'utf-8');
-        content = content.replace(/\r/g, ''); // remove windows-style line endings
+        content = content.replace(/\r/g, '');
         const compressed = fflate.gzipSync(Buffer.from(content, 'utf-8'), {
           level: 9,
         });
 
-        // sanitize gzip header
+        // scrub timestamp + OS byte in gzip header for reproducibility
         compressed[0x4] = 0;
         compressed[0x5] = 0;
         compressed[0x6] = 0;
@@ -49,45 +49,39 @@ const BUILD_PLUGINS = [
 
         if (compressed.byteLength > MAX_BUNDLE_SIZE) {
           throw new Error(
-            `Bundle size is too large (${Math.ceil(
-              compressed.byteLength / 1024
-            )} KB).\n` +
-              `Please reduce the size of the frontend or increase MAX_BUNDLE_SIZE in vite.config.ts.\n`
+            `Bundle size too large (${Math.ceil(compressed.byteLength / 1024)} KB).\n` +
+              `Reduce frontend size or raise MAX_BUNDLE_SIZE in vite.config.ts.\n`
           );
         }
 
-        // Write gzip into dist folder instead of ../../public
         const targetOutputFile = path.join(
           config.build.outDir,
           'index.html.gz'
         );
         fs.writeFileSync(targetOutputFile, compressed);
-        console.log(`[INFO] Gzipped index written to ${targetOutputFile}`);
+        console.log('[INFO] Gzipped index written to', targetOutputFile);
       },
     } satisfies PluginOption;
   })(),
 ];
 
 export default defineConfig({
-  // keep your current plugins / server config
   plugins: process.env.ANALYZE ? FRONTEND_PLUGINS : BUILD_PLUGINS,
-
   server: {
     proxy: {
       '/v1': 'http://127.0.0.1:8081',
-      '/props': 'http://127.0.0.1:8080', // not needed if you serve /props statically (see step 3)
+      '/props': 'http://127.0.0.1:8081',
     },
     headers: {
       'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cross-Origin-Opener-Policy': 'same-origin',
     },
   },
-
-  // NEW: preview behaves like a prod server
   preview: {
     port: 8080,
     proxy: {
       '/v1': 'http://127.0.0.1:8081',
+      '/props': 'http://127.0.0.1:8081',
     },
     headers: {
       'Cross-Origin-Embedder-Policy': 'require-corp',

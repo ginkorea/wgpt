@@ -1,5 +1,11 @@
 {
   "app_name": "WarriorGPT",
-  "default_model": "",
-  "models": []
+  "default_model": "scout17b",
+  "models": [
+    {
+      "name": "scout17b",
+      "display_name": "Llama 4 Scout 17B Instruct (Q4_K_XL)",
+      "type": "openai"
+    }
+  ]
 }
