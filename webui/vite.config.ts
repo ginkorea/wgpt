@@ -40,39 +40,54 @@ const BUILD_PLUGINS = [
           level: 9,
         });
 
-        // because gzip header contains machine-specific info, we must remove these data from the header
-        // timestamp
+        // sanitize gzip header
         compressed[0x4] = 0;
         compressed[0x5] = 0;
         compressed[0x6] = 0;
         compressed[0x7] = 0;
-        // OS
         compressed[0x9] = 0;
 
         if (compressed.byteLength > MAX_BUNDLE_SIZE) {
           throw new Error(
-            `Bundle size is too large (${Math.ceil(compressed.byteLength / 1024)} KB).\n` +
-              `Please reduce the size of the frontend or increase MAX_BUNDLE_SIZE in vite.config.js.\n`
+            `Bundle size is too large (${Math.ceil(
+              compressed.byteLength / 1024
+            )} KB).\n` +
+              `Please reduce the size of the frontend or increase MAX_BUNDLE_SIZE in vite.config.ts.\n`
           );
         }
 
+        // Write gzip into dist folder instead of ../../public
         const targetOutputFile = path.join(
           config.build.outDir,
-          '../../public/index.html.gz'
+          'index.html.gz'
         );
         fs.writeFileSync(targetOutputFile, compressed);
+        console.log(`[INFO] Gzipped index written to ${targetOutputFile}`);
       },
     } satisfies PluginOption;
   })(),
 ];
 
 export default defineConfig({
-  // @ts-ignore
+  // keep your current plugins / server config
   plugins: process.env.ANALYZE ? FRONTEND_PLUGINS : BUILD_PLUGINS,
+
   server: {
     proxy: {
-      '/v1': 'http://localhost:8080',
-      '/props': 'http://localhost:8080',
+      '/v1': 'http://127.0.0.1:8081',
+      '/props': 'http://127.0.0.1:8080', // not needed if you serve /props statically (see step 3)
+    },
+    headers: {
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+      'Cross-Origin-Opener-Policy': 'same-origin',
+    },
+  },
+
+  // NEW: preview behaves like a prod server
+  preview: {
+    port: 8080,
+    proxy: {
+      '/v1': 'http://127.0.0.1:8081',
     },
     headers: {
       'Cross-Origin-Embedder-Policy': 'require-corp',

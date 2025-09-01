@@ -38,6 +38,8 @@ export default function Header() {
     );
   }, [selectedTheme]);
 
+  // inside Header.tsx
+
   // fetch models once
   useEffect(() => {
     let cancelled = false;
@@ -45,11 +47,31 @@ export default function Header() {
       try {
         const resp = await fetch(MODELS_ENDPOINT);
         if (!resp.ok) throw new Error(`Failed to fetch models: ${resp.status}`);
-        const data: ApiModel[] = await resp.json();
+        const raw = await resp.json();
+
+        // Normalize into ApiModel[]
+        let arr: ApiModel[] = [];
+        if (Array.isArray(raw)) {
+          arr = raw;
+        } else if (raw && Array.isArray(raw.data)) {
+          // OpenAI-style format
+          arr = raw.data.map((m: any) => ({
+            name: m.id,
+            display_name: m.id,
+            type: 'openai',
+          }));
+        } else if (raw && Array.isArray(raw.models)) {
+          // our /props-style
+          arr = raw.models as ApiModel[];
+        } else {
+          throw new Error('Unrecognized models payload');
+        }
+
         if (cancelled) return;
-        setModels(data);
-        if (!selectedModel && data.length > 0) {
-          const first = data[0].name;
+        setModels(arr);
+
+        if (!selectedModel && arr.length > 0) {
+          const first = arr[0].name;
           setSelectedModel(first);
           localStorage.setItem(SELECTED_MODEL_KEY, first);
           window.dispatchEvent(
@@ -86,7 +108,7 @@ export default function Header() {
       </label>
 
       {/* App title */}
-      <div className="grow text-2xl font-bold ml-2">WarriorGPT</div>
+      <div className="grow text-2xl font-bold ml-2">🪓 WarriorGPT</div>
 
       {/* Model selector (right side) */}
       <div className="mr-3 hidden sm:flex items-center gap-2">

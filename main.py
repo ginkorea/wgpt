@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-main.py - Controller for WGPT app
+main.py - Start llama-server(s) and the WebUI (Vite Preview)
 - Loads models from models/models.yaml
-- Spawns llama-server instances
-- Sets environment variables for the webui
+- Spawns llama-server instances (ports per runtime section; recommend 8081+)
+- Launches `npm run preview -- --port 8080` to serve built UI
 - Cleans up on shutdown
 """
 
@@ -14,109 +14,85 @@ import signal
 import subprocess
 from pathlib import Path
 
-# Paths
 ROOT_DIR = Path(__file__).parent.resolve()
 MODELS_YAML = ROOT_DIR / "models" / "models.yaml"
-LLAMA_SERVER_BIN = ROOT_DIR / "engines" / "llama-server"
 WEBUI_DIR = ROOT_DIR / "webui"
 
-# Track running servers
-running_procs = {}
-
+procs = {}
 
 def load_models():
-    """Load model registry from models.yaml"""
     if not MODELS_YAML.exists():
         print(f"[ERROR] {MODELS_YAML} not found")
         sys.exit(1)
-
     with open(MODELS_YAML, "r") as f:
-        models = yaml.safe_load(f)
-
-    if not isinstance(models, dict) or "models" not in models:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict) or "models" not in data:
         print("[ERROR] models.yaml must contain a 'models:' key")
         sys.exit(1)
+    return data["models"]
 
-    return models["models"]
-
-
-def start_model_server(model_name, model_config):
-    """Start a llama-server instance for a given model"""
-    model_path = ROOT_DIR / "models" / model_config["path"]
-    port = model_config.get("port", 8080)
-
-    if not model_path.exists():
-        print(f"[ERROR] Model path not found: {model_path}")
+def start_model_server(name, cfg):
+    runtime = cfg.get("runtime", {})
+    bin_path = runtime.get("bin")
+    args = runtime.get("args", [])
+    if not bin_path:
+        print(f"[WARN] No runtime.bin for {name}, skipping")
+        return None
+    bin_abs = (ROOT_DIR / bin_path) if not Path(bin_path).is_absolute() else Path(bin_path)
+    if not bin_abs.exists():
+        print(f"[ERROR] Binary not found: {bin_abs}")
         return None
 
-    cmd = [
-        str(LLAMA_SERVER_BIN),
-        "--model", str(model_path),
-        "--host", "127.0.0.1",
-        "--port", str(port),
-    ]
-
-    print(f"[INFO] Starting {model_name} on port {port}")
-    proc = subprocess.Popen(cmd)
-    running_procs[model_name] = proc
+    cmd = [str(bin_abs)] + args
+    print(f"[INFO] Starting {name}: {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, cwd=ROOT_DIR)
+    procs[name] = proc
     return proc
 
-
-def stop_servers():
-    """Stop all running llama-server processes"""
-    for name, proc in running_procs.items():
-        print(f"[INFO] Stopping {name} (pid={proc.pid})")
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    running_procs.clear()
-
-
-def signal_handler(sig, frame):
-    print("\n[INFO] Caught signal, shutting down...")
-    stop_servers()
-    sys.exit(0)
-
-
-def start_webui():
-    """Start the webui with npm run dev"""
+def start_webui_preview():
     if not WEBUI_DIR.exists():
         print(f"[ERROR] WebUI directory not found: {WEBUI_DIR}")
         return None
+    # Serve the built UI on :8080
+    cmd = ["npm", "run", "preview", "--", "--port", "8080"]
+    print("[INFO] Starting WebUI Preview on http://127.0.0.1:8080")
+    proc = subprocess.Popen(cmd, cwd=WEBUI_DIR)
+    procs["webui"] = proc
+    return proc
 
-    env = os.environ.copy()
-    # Export model registry info so WebUI can connect
-    # e.g. {"llama": "http://127.0.0.1:8080"}
-    env["WGPT_MODELS"] = str({
-        name: f"http://127.0.0.1:{cfg.get('port', 8080)}"
-        for name, cfg in models.items()
-    })
+def stop_all():
+    for name, p in list(procs.items()):
+        if p.poll() is None:
+            print(f"[INFO] Stopping {name} (pid={p.pid})")
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    procs.clear()
 
-    cmd = ["npm", "run", "dev"]
-    print("[INFO] Starting WebUI (npm run dev)...")
-    return subprocess.Popen(cmd, cwd=WEBUI_DIR, env=env)
-
+def handle_signal(sig, frame):
+    print("\n[INFO] Caught signal, shutting down...")
+    stop_all()
+    sys.exit(0)
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
     models = load_models()
 
-    # Start model servers
+    # 1) Start all model servers
     for name, cfg in models.items():
         start_model_server(name, cfg)
 
-    # Start webui
-    webui_proc = start_webui()
+    # 2) Build UI (skip if already built)
+    # You can uncomment this if you want `main.py` to build for you:
+    # subprocess.run(["npm", "run", "build"], cwd=WEBUI_DIR, check=True)
 
-    if webui_proc:
-        running_procs["webui"] = webui_proc
-
-    # Wait for webui to exit
+    # 3) Start Vite Preview on 8080 (serves `webui/dist`)
+    webui_proc = start_webui_preview()
     try:
         webui_proc.wait()
     finally:
-        stop_servers()
+        stop_all()
