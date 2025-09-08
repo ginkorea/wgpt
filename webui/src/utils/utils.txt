@@ -1,0 +1,1198 @@
+# app.context.tsx
+-----
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import {
+  APIMessage,
+  CanvasData,
+  Conversation,
+  LlamaCppServerProps,
+  Message,
+  PendingMessage,
+  ViewingChat,
+} from './types';
+import StorageUtils from './storage';
+import {
+  filterThoughtFromMsgs,
+  normalizeMsgsForAPI,
+  getSSEStreamAsync,
+  getServerProps,
+} from './misc';
+import { BASE_URL, CONFIG_DEFAULT, isDev } from '../Config';
+import { matchPath, useLocation, useNavigate } from 'react-router';
+import toast from 'react-hot-toast';
+
+interface AppContextValue {
+  // conversations and messages
+  viewingChat: ViewingChat | null;
+  pendingMessages: Record<Conversation['id'], PendingMessage>;
+  isGenerating: (convId: string) => boolean;
+  sendMessage: (
+    convId: string | null,
+    leafNodeId: Message['id'] | null,
+    content: string,
+    extra: Message['extra'],
+    onChunk: CallbackGeneratedChunk
+  ) => Promise<boolean>;
+  stopGenerating: (convId: string) => void;
+  replaceMessageAndGenerate: (
+    convId: string,
+    parentNodeId: Message['id'], // the parent node of the message to be replaced
+    content: string | null,
+    extra: Message['extra'],
+    onChunk: CallbackGeneratedChunk
+  ) => Promise<void>;
+
+  // canvas
+  canvasData: CanvasData | null;
+  setCanvasData: (data: CanvasData | null) => void;
+
+  // config
+  config: typeof CONFIG_DEFAULT;
+  saveConfig: (config: typeof CONFIG_DEFAULT) => void;
+  showSettings: boolean;
+  setShowSettings: (show: boolean) => void;
+
+  // props
+  serverProps: LlamaCppServerProps | null;
+}
+
+// this callback is used for scrolling to the bottom of the chat and switching to the last node
+export type CallbackGeneratedChunk = (currLeafNodeId?: Message['id']) => void;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const AppContext = createContext<AppContextValue>({} as any);
+
+const getViewingChat = async (convId: string): Promise<ViewingChat | null> => {
+  const conv = await StorageUtils.getOneConversation(convId);
+  if (!conv) return null;
+  return {
+    conv: conv,
+    // all messages from all branches, not filtered by last node
+    messages: await StorageUtils.getMessages(convId),
+  };
+};
+
+export const AppContextProvider = ({
+  children,
+}: {
+  children: React.ReactElement;
+}) => {
+  const { pathname } = useLocation();
+  const navigate = useNavigate();
+  const params = matchPath('/chat/:convId', pathname);
+  const convId = params?.params?.convId;
+
+  const [serverProps, setServerProps] = useState<LlamaCppServerProps | null>(
+    null
+  );
+  const [viewingChat, setViewingChat] = useState<ViewingChat | null>(null);
+  const [pendingMessages, setPendingMessages] = useState<
+    Record<Conversation['id'], PendingMessage>
+  >({});
+  const [aborts, setAborts] = useState<
+    Record<Conversation['id'], AbortController>
+  >({});
+  const [config, setConfig] = useState(StorageUtils.getConfig());
+  const [canvasData, setCanvasData] = useState<CanvasData | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+
+  // get server props
+  useEffect(() => {
+    getServerProps(BASE_URL, config.apiKey)
+      .then((props) => {
+        console.debug('Server props:', props);
+        setServerProps(props);
+      })
+      .catch((err) => {
+        console.error(err);
+        toast.error('Failed to fetch server props');
+      });
+    // eslint-disable-next-line
+  }, []);
+
+  // handle change when the convId from URL is changed
+  useEffect(() => {
+    // also reset the canvas data
+    setCanvasData(null);
+    const handleConversationChange = async (changedConvId: string) => {
+      if (changedConvId !== convId) return;
+      setViewingChat(await getViewingChat(changedConvId));
+    };
+    StorageUtils.onConversationChanged(handleConversationChange);
+    getViewingChat(convId ?? '').then(setViewingChat);
+    return () => {
+      StorageUtils.offConversationChanged(handleConversationChange);
+    };
+  }, [convId]);
+
+  const setPending = (convId: string, pendingMsg: PendingMessage | null) => {
+    // if pendingMsg is null, remove the key from the object
+    if (!pendingMsg) {
+      setPendingMessages((prev) => {
+        const newState = { ...prev };
+        delete newState[convId];
+        return newState;
+      });
+    } else {
+      setPendingMessages((prev) => ({ ...prev, [convId]: pendingMsg }));
+    }
+  };
+
+  const setAbort = (convId: string, controller: AbortController | null) => {
+    if (!controller) {
+      setAborts((prev) => {
+        const newState = { ...prev };
+        delete newState[convId];
+        return newState;
+      });
+    } else {
+      setAborts((prev) => ({ ...prev, [convId]: controller }));
+    }
+  };
+
+  ////////////////////////////////////////////////////////////////////////
+  // public functions
+
+  const isGenerating = (convId: string) => !!pendingMessages[convId];
+
+  const generateMessage = async (
+    convId: string,
+    leafNodeId: Message['id'],
+    onChunk: CallbackGeneratedChunk
+  ) => {
+    if (isGenerating(convId)) return;
+
+    const config = StorageUtils.getConfig();
+    const currConversation = await StorageUtils.getOneConversation(convId);
+    if (!currConversation) {
+      throw new Error('Current conversation is not found');
+    }
+
+    const currMessages = StorageUtils.filterByLeafNodeId(
+      await StorageUtils.getMessages(convId),
+      leafNodeId,
+      false
+    );
+    const abortController = new AbortController();
+    setAbort(convId, abortController);
+
+    if (!currMessages) {
+      throw new Error('Current messages are not found');
+    }
+
+    const pendingId = Date.now() + 1;
+    let pendingMsg: PendingMessage = {
+      id: pendingId,
+      convId,
+      type: 'text',
+      timestamp: pendingId,
+      role: 'assistant',
+      content: null,
+      parent: leafNodeId,
+      children: [],
+    };
+    setPending(convId, pendingMsg);
+
+    try {
+      // prepare messages for API
+      let messages: APIMessage[] = [
+        ...(config.systemMessage.length === 0
+          ? []
+          : [{ role: 'system', content: config.systemMessage } as APIMessage]),
+        ...normalizeMsgsForAPI(currMessages),
+      ];
+      if (config.excludeThoughtOnReq) {
+        messages = filterThoughtFromMsgs(messages);
+      }
+      if (isDev) console.log({ messages });
+
+      // prepare params
+      const params = {
+        messages,
+        stream: true,
+        cache_prompt: true,
+        reasoning_format: 'none',
+        samplers: config.samplers,
+        temperature: config.temperature,
+        dynatemp_range: config.dynatemp_range,
+        dynatemp_exponent: config.dynatemp_exponent,
+        top_k: config.top_k,
+        top_p: config.top_p,
+        min_p: config.min_p,
+        typical_p: config.typical_p,
+        xtc_probability: config.xtc_probability,
+        xtc_threshold: config.xtc_threshold,
+        repeat_last_n: config.repeat_last_n,
+        repeat_penalty: config.repeat_penalty,
+        presence_penalty: config.presence_penalty,
+        frequency_penalty: config.frequency_penalty,
+        dry_multiplier: config.dry_multiplier,
+        dry_base: config.dry_base,
+        dry_allowed_length: config.dry_allowed_length,
+        dry_penalty_last_n: config.dry_penalty_last_n,
+        max_tokens: config.max_tokens,
+        timings_per_token: !!config.showTokensPerSecond,
+        ...(config.custom.length ? JSON.parse(config.custom) : {}),
+      };
+
+      // send request
+      const fetchResponse = await fetch(`${BASE_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(config.apiKey
+            ? { Authorization: `Bearer ${config.apiKey}` }
+            : {}),
+        },
+        body: JSON.stringify(params),
+        signal: abortController.signal,
+      });
+      if (fetchResponse.status !== 200) {
+        const body = await fetchResponse.json();
+        throw new Error(body?.error?.message || 'Unknown error');
+      }
+      const chunks = getSSEStreamAsync(fetchResponse);
+      for await (const chunk of chunks) {
+        // const stop = chunk.stop;
+        if (chunk.error) {
+          throw new Error(chunk.error?.message || 'Unknown error');
+        }
+        const addedContent = chunk.choices[0]?.delta.content;
+        const lastContent = pendingMsg.content || '';
+        if (addedContent) {
+          pendingMsg = {
+            ...pendingMsg,
+            content: lastContent + addedContent,
+          };
+        }
+        const timings = chunk.timings;
+        if (timings && config.showTokensPerSecond) {
+          // only extract what's really needed, to save some space
+          pendingMsg.timings = {
+            prompt_n: timings.prompt_n,
+            prompt_ms: timings.prompt_ms,
+            predicted_n: timings.predicted_n,
+            predicted_ms: timings.predicted_ms,
+          };
+        }
+        setPending(convId, pendingMsg);
+        onChunk(); // don't need to switch node for pending message
+      }
+    } catch (err) {
+      setPending(convId, null);
+      if ((err as Error).name === 'AbortError') {
+        // user stopped the generation via stopGeneration() function
+        // we can safely ignore this error
+      } else {
+        console.error(err);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        toast.error((err as any)?.message ?? 'Unknown error');
+        throw err; // rethrow
+      }
+    }
+
+    if (pendingMsg.content !== null) {
+      await StorageUtils.appendMsg(pendingMsg as Message, leafNodeId);
+    }
+    setPending(convId, null);
+    onChunk(pendingId); // trigger scroll to bottom and switch to the last node
+  };
+
+  const sendMessage = async (
+    convId: string | null,
+    leafNodeId: Message['id'] | null,
+    content: string,
+    extra: Message['extra'],
+    onChunk: CallbackGeneratedChunk
+  ): Promise<boolean> => {
+    if (isGenerating(convId ?? '') || content.trim().length === 0) return false;
+
+    if (convId === null || convId.length === 0 || leafNodeId === null) {
+      const conv = await StorageUtils.createConversation(
+        content.substring(0, 256)
+      );
+      convId = conv.id;
+      leafNodeId = conv.currNode;
+      // if user is creating a new conversation, redirect to the new conversation
+      navigate(`/chat/${convId}`);
+    }
+
+    const now = Date.now();
+    const currMsgId = now;
+    StorageUtils.appendMsg(
+      {
+        id: currMsgId,
+        timestamp: now,
+        type: 'text',
+        convId,
+        role: 'user',
+        content,
+        extra,
+        parent: leafNodeId,
+        children: [],
+      },
+      leafNodeId
+    );
+    onChunk(currMsgId);
+
+    try {
+      await generateMessage(convId, currMsgId, onChunk);
+      return true;
+    } catch (_) {
+      // TODO: rollback
+    }
+    return false;
+  };
+
+  const stopGenerating = (convId: string) => {
+    setPending(convId, null);
+    aborts[convId]?.abort();
+  };
+
+  // if content is undefined, we remove last assistant message
+  const replaceMessageAndGenerate = async (
+    convId: string,
+    parentNodeId: Message['id'], // the parent node of the message to be replaced
+    content: string | null,
+    extra: Message['extra'],
+    onChunk: CallbackGeneratedChunk
+  ) => {
+    if (isGenerating(convId)) return;
+
+    if (content !== null) {
+      const now = Date.now();
+      const currMsgId = now;
+      StorageUtils.appendMsg(
+        {
+          id: currMsgId,
+          timestamp: now,
+          type: 'text',
+          convId,
+          role: 'user',
+          content,
+          extra,
+          parent: parentNodeId,
+          children: [],
+        },
+        parentNodeId
+      );
+      parentNodeId = currMsgId;
+    }
+    onChunk(parentNodeId);
+
+    await generateMessage(convId, parentNodeId, onChunk);
+  };
+
+  const saveConfig = (config: typeof CONFIG_DEFAULT) => {
+    StorageUtils.setConfig(config);
+    setConfig(config);
+  };
+
+  return (
+    <AppContext.Provider
+      value={{
+        isGenerating,
+        viewingChat,
+        pendingMessages,
+        sendMessage,
+        stopGenerating,
+        replaceMessageAndGenerate,
+        canvasData,
+        setCanvasData,
+        config,
+        saveConfig,
+        showSettings,
+        setShowSettings,
+        serverProps,
+      }}
+    >
+      {children}
+    </AppContext.Provider>
+  );
+};
+
+export const useAppContext = () => useContext(AppContext);
+
+# common.tsx
+-----
+export const XCloseButton: React.ElementType<
+  React.ClassAttributes<HTMLButtonElement> &
+    React.HTMLAttributes<HTMLButtonElement>
+> = ({ className, ...props }) => (
+  <button className={`btn btn-square btn-sm ${className ?? ''}`} {...props}>
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      className="h-6 w-6"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+        d="M6 18L18 6M6 6l12 12"
+      />
+    </svg>
+  </button>
+);
+
+export const OpenInNewTab = ({
+  href,
+  children,
+}: {
+  href: string;
+  children: string;
+}) => (
+  <a
+    className="underline"
+    href={href}
+    target="_blank"
+    rel="noopener noreferrer"
+  >
+    {children}
+  </a>
+);
+
+export function BtnWithTooltips({
+  className,
+  onClick,
+  onMouseLeave,
+  children,
+  tooltipsContent,
+  disabled,
+}: {
+  className?: string;
+  onClick: () => void;
+  onMouseLeave?: () => void;
+  children: React.ReactNode;
+  tooltipsContent: string;
+  disabled?: boolean;
+}) {
+  // the onClick handler is on the container, so screen readers can safely ignore the inner button
+  // this prevents the label from being read twice
+  return (
+    <div
+      className="tooltip tooltip-bottom"
+      data-tip={tooltipsContent}
+      role="button"
+      onClick={onClick}
+    >
+      <button
+        className={`${className ?? ''} flex items-center justify-center`}
+        disabled={disabled}
+        onMouseLeave={onMouseLeave}
+        aria-hidden={true}
+      >
+        {children}
+      </button>
+    </div>
+  );
+}
+
+# llama-vscode.ts
+-----
+import { useEffect } from 'react';
+import { ChatTextareaApi } from '../components/useChatTextarea.ts';
+import { ChatExtraContextApi } from '../components/useChatExtraContext.tsx';
+
+// Extra context when using llama.cpp WebUI from llama-vscode, inside an iframe
+// Ref: https://github.com/ggml-org/llama.cpp/pull/11940
+
+interface SetTextEvData {
+  text: string;
+  context: string;
+}
+
+/**
+ * To test it:
+ * window.postMessage({ command: 'setText', text: 'Spot the syntax error', context: 'def test()\n  return 123' }, '*');
+ */
+
+export const useVSCodeContext = (
+  textarea: ChatTextareaApi,
+  extraContext: ChatExtraContextApi
+) => {
+  // Accept setText message from a parent window and set inputMsg and extraContext
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.command === 'setText') {
+        const data: SetTextEvData = event.data;
+        textarea.setValue(data?.text);
+        if (data?.context && data.context.length > 0) {
+          extraContext.clearItems();
+          extraContext.addItems([
+            {
+              type: 'context',
+              name: 'Extra context',
+              content: data.context,
+            },
+          ]);
+        }
+        textarea.focus();
+        setTimeout(() => {
+          textarea.refOnSubmit.current?.();
+        }, 10); // wait for setExtraContext to finish
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [textarea, extraContext]);
+
+  // Add a keydown listener that sends the "escapePressed" message to the parent window
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        window.parent.postMessage({ command: 'escapePressed' }, '*');
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  return {};
+};
+
+# misc.ts
+-----
+// @ts-expect-error this package does not have typing
+import TextLineStream from 'textlinestream';
+import {
+  APIMessage,
+  APIMessageContentPart,
+  LlamaCppServerProps,
+  Message,
+} from './types';
+
+// ponyfill for missing ReadableStream asyncIterator on Safari
+import { asyncIterator } from '@sec-ant/readable-stream/ponyfill/asyncIterator';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const isString = (x: any) => !!x.toLowerCase;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const isBoolean = (x: any) => x === true || x === false;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const isNumeric = (n: any) => !isString(n) && !isNaN(n) && !isBoolean(n);
+export const escapeAttr = (str: string) =>
+  str.replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// wrapper for SSE
+export async function* getSSEStreamAsync(fetchResponse: Response) {
+  if (!fetchResponse.body) throw new Error('Response body is empty');
+  const lines: ReadableStream<string> = fetchResponse.body
+    .pipeThrough(new TextDecoderStream())
+    .pipeThrough(new TextLineStream());
+  // @ts-expect-error asyncIterator complains about type, but it should work
+  for await (const line of asyncIterator(lines)) {
+    //if (isDev) console.log({ line });
+    if (line.startsWith('data:') && !line.endsWith('[DONE]')) {
+      const data = JSON.parse(line.slice(5));
+      yield data;
+    } else if (line.startsWith('error:')) {
+      const data = JSON.parse(line.slice(6));
+      throw new Error(data.message || 'Unknown error');
+    }
+  }
+}
+
+// copy text to clipboard
+export const copyStr = (textToCopy: string) => {
+  // Navigator clipboard api needs a secure context (https)
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(textToCopy);
+  } else {
+    // Use the 'out of viewport hidden text area' trick
+    const textArea = document.createElement('textarea');
+    textArea.value = textToCopy;
+    // Move textarea out of the viewport so it's not visible
+    textArea.style.position = 'absolute';
+    textArea.style.left = '-999999px';
+    document.body.prepend(textArea);
+    textArea.select();
+    document.execCommand('copy');
+  }
+};
+
+/**
+ * filter out redundant fields upon sending to API
+ * also format extra into text
+ */
+export function normalizeMsgsForAPI(messages: Readonly<Message[]>) {
+  return messages.map((msg) => {
+    if (msg.role !== 'user' || !msg.extra) {
+      return {
+        role: msg.role,
+        content: msg.content,
+      } as APIMessage;
+    }
+
+    // extra content first, then user text message in the end
+    // this allow re-using the same cache prefix for long context
+    const contentArr: APIMessageContentPart[] = [];
+
+    for (const extra of msg.extra ?? []) {
+      if (extra.type === 'context') {
+        contentArr.push({
+          type: 'text',
+          text: extra.content,
+        });
+      } else if (extra.type === 'textFile') {
+        contentArr.push({
+          type: 'text',
+          text: `File: ${extra.name}\nContent:\n\n${extra.content}`,
+        });
+      } else if (extra.type === 'imageFile') {
+        contentArr.push({
+          type: 'image_url',
+          image_url: { url: extra.base64Url },
+        });
+      } else if (extra.type === 'audioFile') {
+        contentArr.push({
+          type: 'input_audio',
+          input_audio: {
+            data: extra.base64Data,
+            format: /wav/.test(extra.mimeType) ? 'wav' : 'mp3',
+          },
+        });
+      } else {
+        throw new Error('Unknown extra type');
+      }
+    }
+
+    // add user message to the end
+    contentArr.push({
+      type: 'text',
+      text: msg.content,
+    });
+
+    return {
+      role: msg.role,
+      content: contentArr,
+    };
+  }) as APIMessage[];
+}
+
+/**
+ * recommended for DeepsSeek-R1, filter out content between <think> and </think> tags
+ */
+export function filterThoughtFromMsgs(messages: APIMessage[]) {
+  console.debug({ messages });
+  return messages.map((msg) => {
+    if (msg.role !== 'assistant') {
+      return msg;
+    }
+    // assistant message is always a string
+    const contentStr = msg.content as string;
+    return {
+      role: msg.role,
+      content:
+        msg.role === 'assistant'
+          ? contentStr
+              .split(/<\/think>|<\|end\|>/)
+              .at(-1)!
+              .trim()
+          : contentStr,
+    } as APIMessage;
+  });
+}
+
+export function classNames(classes: Record<string, boolean>): string {
+  return Object.entries(classes)
+    .filter(([_, value]) => value)
+    .map(([key, _]) => key)
+    .join(' ');
+}
+
+export const delay = (ms: number) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+export const throttle = <T extends unknown[]>(
+  callback: (...args: T) => void,
+  delay: number
+) => {
+  let isWaiting = false;
+
+  return (...args: T) => {
+    if (isWaiting) {
+      return;
+    }
+
+    callback(...args);
+    isWaiting = true;
+
+    setTimeout(() => {
+      isWaiting = false;
+    }, delay);
+  };
+};
+
+export const cleanCurrentUrl = (removeQueryParams: string[]) => {
+  const url = new URL(window.location.href);
+  removeQueryParams.forEach((param) => {
+    url.searchParams.delete(param);
+  });
+  window.history.replaceState({}, '', url.toString());
+};
+
+export const getServerProps = async (
+  baseUrl: string,
+  apiKey?: string
+): Promise<LlamaCppServerProps> => {
+  try {
+    const response = await fetch(`${baseUrl}/props`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+    });
+    if (!response.ok) {
+      throw new Error('Failed to fetch server props');
+    }
+    const data = await response.json();
+    return data as LlamaCppServerProps;
+  } catch (error) {
+    console.error('Error fetching server props:', error);
+    throw error;
+  }
+};
+
+# storage.ts
+-----
+// coversations is stored in localStorage
+// format: { [convId]: { id: string, lastModified: number, messages: [...] } }
+
+import { CONFIG_DEFAULT } from '../Config';
+import { Conversation, Message, TimingReport } from './types';
+import Dexie, { Table } from 'dexie';
+
+const event = new EventTarget();
+
+type CallbackConversationChanged = (convId: string) => void;
+let onConversationChangedHandlers: [
+  CallbackConversationChanged,
+  EventListener,
+][] = [];
+const dispatchConversationChange = (convId: string) => {
+  event.dispatchEvent(
+    new CustomEvent('conversationChange', { detail: { convId } })
+  );
+};
+
+const db = new Dexie('LlamacppWebui') as Dexie & {
+  conversations: Table<Conversation>;
+  messages: Table<Message>;
+};
+
+// https://dexie.org/docs/Version/Version.stores()
+db.version(1).stores({
+  // Unlike SQL, you don’t need to specify all properties but only the one you wish to index.
+  conversations: '&id, lastModified',
+  messages: '&id, convId, [convId+id], timestamp',
+});
+
+// convId is a string prefixed with 'conv-'
+const StorageUtils = {
+  /**
+   * manage conversations
+   */
+  async getAllConversations(): Promise<Conversation[]> {
+    await migrationLStoIDB().catch(console.error); // noop if already migrated
+    return (await db.conversations.toArray()).sort(
+      (a, b) => b.lastModified - a.lastModified
+    );
+  },
+  /**
+   * can return null if convId does not exist
+   */
+  async getOneConversation(convId: string): Promise<Conversation | null> {
+    return (await db.conversations.where('id').equals(convId).first()) ?? null;
+  },
+  /**
+   * get all message nodes in a conversation
+   */
+  async getMessages(convId: string): Promise<Message[]> {
+    return await db.messages.where({ convId }).toArray();
+  },
+  /**
+   * use in conjunction with getMessages to filter messages by leafNodeId
+   * includeRoot: whether to include the root node in the result
+   * if node with leafNodeId does not exist, return the path with the latest timestamp
+   */
+  filterByLeafNodeId(
+    msgs: Readonly<Message[]>,
+    leafNodeId: Message['id'],
+    includeRoot: boolean
+  ): Readonly<Message[]> {
+    const res: Message[] = [];
+    const nodeMap = new Map<Message['id'], Message>();
+    for (const msg of msgs) {
+      nodeMap.set(msg.id, msg);
+    }
+    let startNode: Message | undefined = nodeMap.get(leafNodeId);
+    if (!startNode) {
+      // if not found, we return the path with the latest timestamp
+      let latestTime = -1;
+      for (const msg of msgs) {
+        if (msg.timestamp > latestTime) {
+          startNode = msg;
+          latestTime = msg.timestamp;
+        }
+      }
+    }
+    // traverse the path from leafNodeId to root
+    // startNode can never be undefined here
+    let currNode: Message | undefined = startNode;
+    while (currNode) {
+      if (currNode.type !== 'root' || (currNode.type === 'root' && includeRoot))
+        res.push(currNode);
+      currNode = nodeMap.get(currNode.parent ?? -1);
+    }
+    res.sort((a, b) => a.timestamp - b.timestamp);
+    return res;
+  },
+  /**
+   * create a new conversation with a default root node
+   */
+  async createConversation(name: string): Promise<Conversation> {
+    const now = Date.now();
+    const msgId = now;
+    const conv: Conversation = {
+      id: `conv-${now}`,
+      lastModified: now,
+      currNode: msgId,
+      name,
+    };
+    await db.conversations.add(conv);
+    // create a root node
+    await db.messages.add({
+      id: msgId,
+      convId: conv.id,
+      type: 'root',
+      timestamp: now,
+      role: 'system',
+      content: '',
+      parent: -1,
+      children: [],
+    });
+    return conv;
+  },
+  /**
+   * update the name of a conversation
+   */
+  async updateConversationName(convId: string, name: string): Promise<void> {
+    await db.conversations.update(convId, {
+      name,
+      lastModified: Date.now(),
+    });
+    dispatchConversationChange(convId);
+  },
+  /**
+   * if convId does not exist, throw an error
+   */
+  async appendMsg(
+    msg: Exclude<Message, 'parent' | 'children'>,
+    parentNodeId: Message['id']
+  ): Promise<void> {
+    if (msg.content === null) return;
+    const { convId } = msg;
+    await db.transaction('rw', db.conversations, db.messages, async () => {
+      const conv = await StorageUtils.getOneConversation(convId);
+      const parentMsg = await db.messages
+        .where({ convId, id: parentNodeId })
+        .first();
+      // update the currNode of conversation
+      if (!conv) {
+        throw new Error(`Conversation ${convId} does not exist`);
+      }
+      if (!parentMsg) {
+        throw new Error(
+          `Parent message ID ${parentNodeId} does not exist in conversation ${convId}`
+        );
+      }
+      await db.conversations.update(convId, {
+        lastModified: Date.now(),
+        currNode: msg.id,
+      });
+      // update parent
+      await db.messages.update(parentNodeId, {
+        children: [...parentMsg.children, msg.id],
+      });
+      // create message
+      await db.messages.add({
+        ...msg,
+        parent: parentNodeId,
+        children: [],
+      });
+    });
+    dispatchConversationChange(convId);
+  },
+  /**
+   * remove conversation by id
+   */
+  async remove(convId: string): Promise<void> {
+    await db.transaction('rw', db.conversations, db.messages, async () => {
+      await db.conversations.delete(convId);
+      await db.messages.where({ convId }).delete();
+    });
+    dispatchConversationChange(convId);
+  },
+
+  // event listeners
+  onConversationChanged(callback: CallbackConversationChanged) {
+    const fn = (e: Event) => callback((e as CustomEvent).detail.convId);
+    onConversationChangedHandlers.push([callback, fn]);
+    event.addEventListener('conversationChange', fn);
+  },
+  offConversationChanged(callback: CallbackConversationChanged) {
+    const fn = onConversationChangedHandlers.find(([cb, _]) => cb === callback);
+    if (fn) {
+      event.removeEventListener('conversationChange', fn[1]);
+    }
+    onConversationChangedHandlers = [];
+  },
+
+  // manage config
+  getConfig(): typeof CONFIG_DEFAULT {
+    const savedVal = JSON.parse(localStorage.getItem('config') || '{}');
+    // to prevent breaking changes in the future, we always provide default value for missing keys
+    return {
+      ...CONFIG_DEFAULT,
+      ...savedVal,
+    };
+  },
+  setConfig(config: typeof CONFIG_DEFAULT) {
+    localStorage.setItem('config', JSON.stringify(config));
+  },
+  getTheme(): string {
+    return localStorage.getItem('theme') || 'auto';
+  },
+  setTheme(theme: string) {
+    if (theme === 'auto') {
+      localStorage.removeItem('theme');
+    } else {
+      localStorage.setItem('theme', theme);
+    }
+  },
+};
+
+export default StorageUtils;
+
+// Migration from localStorage to IndexedDB
+
+// these are old types, LS prefix stands for LocalStorage
+interface LSConversation {
+  id: string; // format: `conv-{timestamp}`
+  lastModified: number; // timestamp from Date.now()
+  messages: LSMessage[];
+}
+interface LSMessage {
+  id: number;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  timings?: TimingReport;
+}
+async function migrationLStoIDB() {
+  if (localStorage.getItem('migratedToIDB')) return;
+  const res: LSConversation[] = [];
+  for (const key in localStorage) {
+    if (key.startsWith('conv-')) {
+      res.push(JSON.parse(localStorage.getItem(key) ?? '{}'));
+    }
+  }
+  if (res.length === 0) return;
+  await db.transaction('rw', db.conversations, db.messages, async () => {
+    let migratedCount = 0;
+    for (const conv of res) {
+      const { id: convId, lastModified, messages } = conv;
+      const firstMsg = messages[0];
+      const lastMsg = messages.at(-1);
+      if (messages.length < 2 || !firstMsg || !lastMsg) {
+        console.log(
+          `Skipping conversation ${convId} with ${messages.length} messages`
+        );
+        continue;
+      }
+      const name = firstMsg.content ?? '(no messages)';
+      await db.conversations.add({
+        id: convId,
+        lastModified,
+        currNode: lastMsg.id,
+        name,
+      });
+      const rootId = messages[0].id - 2;
+      await db.messages.add({
+        id: rootId,
+        convId: convId,
+        type: 'root',
+        timestamp: rootId,
+        role: 'system',
+        content: '',
+        parent: -1,
+        children: [firstMsg.id],
+      });
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        await db.messages.add({
+          ...msg,
+          type: 'text',
+          convId: convId,
+          timestamp: msg.id,
+          parent: i === 0 ? rootId : messages[i - 1].id,
+          children: i === messages.length - 1 ? [] : [messages[i + 1].id],
+        });
+      }
+      migratedCount++;
+      console.log(
+        `Migrated conversation ${convId} with ${messages.length} messages`
+      );
+    }
+    console.log(
+      `Migrated ${migratedCount} conversations from localStorage to IndexedDB`
+    );
+    localStorage.setItem('migratedToIDB', '1');
+  });
+}
+
+# types.ts
+-----
+export interface TimingReport {
+  prompt_n: number;
+  prompt_ms: number;
+  predicted_n: number;
+  predicted_ms: number;
+}
+
+/**
+ * What is conversation "branching"? It is a feature that allows the user to edit an old message in the history, while still keeping the conversation flow.
+ * Inspired by ChatGPT / Claude / Hugging Chat where you edit a message, a new branch of the conversation is created, and the old message is still visible.
+ *
+ * We use the same node-based structure like other chat UIs, where each message has a parent and children. A "root" message is the first message in a conversation, which will not be displayed in the UI.
+ *
+ * root
+ *  ├── message 1
+ *  │      └── message 2
+ *  │             └── message 3
+ *  └── message 4
+ *        └── message 5
+ *
+ * In the above example, assuming that user wants to edit message 2, a new branch will be created:
+ *
+ *          ├── message 2
+ *          │   └── message 3
+ *          └── message 6
+ *
+ * Message 2 and 6 are siblings, and message 6 is the new branch.
+ *
+ * We only need to know the last node (aka leaf) to get the current branch. In the above example, message 5 is the leaf of branch containing message 4 and 5.
+ *
+ * For the implementation:
+ * - StorageUtils.getMessages() returns list of all nodes
+ * - StorageUtils.filterByLeafNodeId() filters the list of nodes from a given leaf node
+ */
+
+// Note: the term "message" and "node" are used interchangeably in this context
+export interface Message {
+  id: number;
+  convId: string;
+  type: 'text' | 'root';
+  timestamp: number; // timestamp from Date.now()
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  timings?: TimingReport;
+  extra?: MessageExtra[];
+  // node based system for branching
+  parent: Message['id'];
+  children: Message['id'][];
+}
+
+export type MessageExtra =
+  | MessageExtraTextFile
+  | MessageExtraImageFile
+  | MessageExtraAudioFile
+  | MessageExtraContext;
+
+export interface MessageExtraTextFile {
+  type: 'textFile';
+  name: string;
+  content: string;
+}
+
+export interface MessageExtraImageFile {
+  type: 'imageFile';
+  name: string;
+  base64Url: string;
+}
+
+export interface MessageExtraAudioFile {
+  type: 'audioFile';
+  name: string;
+  base64Data: string;
+  mimeType: string;
+}
+
+export interface MessageExtraContext {
+  type: 'context';
+  name: string;
+  content: string;
+}
+
+export type APIMessageContentPart =
+  | {
+      type: 'text';
+      text: string;
+    }
+  | {
+      type: 'image_url';
+      image_url: { url: string };
+    }
+  | {
+      type: 'input_audio';
+      input_audio: { data: string; format: 'wav' | 'mp3' };
+    };
+
+export type APIMessage = {
+  role: Message['role'];
+  content: string | APIMessageContentPart[];
+};
+
+export interface Conversation {
+  id: string; // format: `conv-{timestamp}`
+  lastModified: number; // timestamp from Date.now()
+  currNode: Message['id']; // the current message node being viewed
+  name: string;
+}
+
+export interface ViewingChat {
+  conv: Readonly<Conversation>;
+  messages: Readonly<Message[]>;
+}
+
+export type PendingMessage = Omit<Message, 'content'> & {
+  content: string | null;
+};
+
+export enum CanvasType {
+  PY_INTERPRETER,
+}
+
+export interface CanvasPyInterpreter {
+  type: CanvasType.PY_INTERPRETER;
+  content: string;
+}
+
+export type CanvasData = CanvasPyInterpreter;
+
+// a non-complete list of props, only contains the ones we need
+export interface LlamaCppServerProps {
+  build_info: string;
+  model_path: string;
+  n_ctx: number;
+  modalities?: {
+    vision: boolean;
+    audio: boolean;
+  };
+  display_name?: string; // 👈 add this
+}
+

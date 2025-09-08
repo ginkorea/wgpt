@@ -1,0 +1,3222 @@
+# CanvasPyInterpreter.tsx
+-----
+import { useEffect, useState } from 'react';
+import { useAppContext } from '../utils/app.context';
+import { OpenInNewTab, XCloseButton } from '../utils/common';
+import { CanvasType } from '../utils/types';
+import { PlayIcon, StopIcon } from '@heroicons/react/24/outline';
+import StorageUtils from '../utils/storage';
+
+const canInterrupt = typeof SharedArrayBuffer === 'function';
+
+// adapted from https://pyodide.org/en/stable/usage/webworker.html
+const WORKER_CODE = `
+importScripts("https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.js");
+
+let stdOutAndErr = [];
+
+let pyodideReadyPromise = loadPyodide({
+  stdout: (data) => stdOutAndErr.push(data),
+  stderr: (data) => stdOutAndErr.push(data),
+});
+
+let alreadySetBuff = false;
+
+self.onmessage = async (event) => {
+  stdOutAndErr = [];
+
+  // make sure loading is done
+  const pyodide = await pyodideReadyPromise;
+  const { id, python, context, interruptBuffer } = event.data;
+
+  if (interruptBuffer && !alreadySetBuff) {
+    pyodide.setInterruptBuffer(interruptBuffer);
+    alreadySetBuff = true;
+  }
+
+  // Now load any packages we need, run the code, and send the result back.
+  await pyodide.loadPackagesFromImports(python);
+
+  // make a Python dictionary with the data from content
+  const dict = pyodide.globals.get("dict");
+  const globals = dict(Object.entries(context));
+  try {
+    self.postMessage({ id, running: true });
+    // Execute the python code in this context
+    const result = pyodide.runPython(python, { globals });
+    self.postMessage({ result, id, stdOutAndErr });
+  } catch (error) {
+    self.postMessage({ error: error.message, id });
+  }
+  interruptBuffer[0] = 0;
+};
+`;
+
+let worker: Worker;
+const interruptBuffer = canInterrupt
+  ? new Uint8Array(new SharedArrayBuffer(1))
+  : null;
+
+const startWorker = () => {
+  if (!worker) {
+    worker = new Worker(
+      URL.createObjectURL(new Blob([WORKER_CODE], { type: 'text/javascript' }))
+    );
+  }
+};
+
+if (StorageUtils.getConfig().pyIntepreterEnabled) {
+  startWorker();
+}
+
+const runCodeInWorker = (
+  pyCode: string,
+  callbackRunning: () => void
+): {
+  donePromise: Promise<string>;
+  interrupt: () => void;
+} => {
+  startWorker();
+  const id = Math.random() * 1e8;
+  const context = {};
+  if (interruptBuffer) {
+    interruptBuffer[0] = 0;
+  }
+
+  const donePromise = new Promise<string>((resolve) => {
+    worker.onmessage = (event) => {
+      const { error, stdOutAndErr, running } = event.data;
+      if (id !== event.data.id) return;
+      if (running) {
+        callbackRunning();
+        return;
+      } else if (error) {
+        resolve(error.toString());
+      } else {
+        resolve(stdOutAndErr.join('\n'));
+      }
+    };
+    worker.postMessage({ id, python: pyCode, context, interruptBuffer });
+  });
+
+  const interrupt = () => {
+    console.log('Interrupting...');
+    console.trace();
+    if (interruptBuffer) {
+      interruptBuffer[0] = 2;
+    }
+  };
+
+  return { donePromise, interrupt };
+};
+
+export default function CanvasPyInterpreter() {
+  const { canvasData, setCanvasData } = useAppContext();
+
+  const [code, setCode] = useState(canvasData?.content ?? ''); // copy to avoid direct mutation
+  const [running, setRunning] = useState(false);
+  const [output, setOutput] = useState('');
+  const [interruptFn, setInterruptFn] = useState<() => void>();
+  const [showStopBtn, setShowStopBtn] = useState(false);
+
+  const runCode = async (pycode: string) => {
+    interruptFn?.();
+    setRunning(true);
+    setOutput('Loading Pyodide...');
+    const { donePromise, interrupt } = runCodeInWorker(pycode, () => {
+      setOutput('Running...');
+      setShowStopBtn(canInterrupt);
+    });
+    setInterruptFn(() => interrupt);
+    const out = await donePromise;
+    setOutput(out);
+    setRunning(false);
+    setShowStopBtn(false);
+  };
+
+  // run code on mount
+  useEffect(() => {
+    setCode(canvasData?.content ?? '');
+    runCode(canvasData?.content ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasData?.content]);
+
+  if (canvasData?.type !== CanvasType.PY_INTERPRETER) {
+    return null;
+  }
+
+  return (
+    <div className="card bg-base-200 w-full h-full shadow-xl">
+      <div className="card-body">
+        <div className="flex justify-between items-center mb-4">
+          <span className="text-lg font-bold">Python Interpreter</span>
+          <XCloseButton
+            className="bg-base-100"
+            onClick={() => setCanvasData(null)}
+          />
+        </div>
+        <div className="grid grid-rows-3 gap-4 h-full">
+          <textarea
+            className="textarea textarea-bordered w-full h-full font-mono"
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+          ></textarea>
+          <div className="font-mono flex flex-col row-span-2">
+            <div className="flex items-center mb-2">
+              <button
+                className="btn btn-sm bg-base-100"
+                onClick={() => runCode(code)}
+                disabled={running}
+              >
+                <PlayIcon className="h-6 w-6" /> Run
+              </button>
+              {showStopBtn && (
+                <button
+                  className="btn btn-sm bg-base-100 ml-2"
+                  onClick={() => interruptFn?.()}
+                >
+                  <StopIcon className="h-6 w-6" /> Stop
+                </button>
+              )}
+              <span className="grow text-right text-xs">
+                <OpenInNewTab href="https://github.com/ggerganov/llama.cpp/issues/11762">
+                  Report a bug
+                </OpenInNewTab>
+              </span>
+            </div>
+            <textarea
+              className="textarea textarea-bordered h-full dark-color"
+              value={output}
+              readOnly
+            ></textarea>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ChatInputExtraContextItem.tsx
+-----
+import {
+  DocumentTextIcon,
+  SpeakerWaveIcon,
+  XMarkIcon,
+} from '@heroicons/react/24/outline';
+import { MessageExtra } from '../utils/types';
+import { useState } from 'react';
+import { classNames } from '../utils/misc';
+
+export default function ChatInputExtraContextItem({
+  items,
+  removeItem,
+  clickToShow,
+}: {
+  items?: MessageExtra[];
+  removeItem?: (index: number) => void;
+  clickToShow?: boolean;
+}) {
+  const [show, setShow] = useState(-1);
+  const showingItem = show >= 0 ? items?.[show] : undefined;
+
+  if (!items) return null;
+
+  return (
+    <div
+      className="flex flex-row gap-4 overflow-x-auto py-2 px-1 mb-1"
+      role="group"
+      aria-description="Selected files"
+    >
+      {items.map((item, i) => (
+        <div
+          className="indicator"
+          key={i}
+          onClick={() => clickToShow && setShow(i)}
+          tabIndex={0}
+          aria-description={
+            clickToShow ? `Click to show: ${item.name}` : undefined
+          }
+          role={clickToShow ? 'button' : 'menuitem'}
+        >
+          {removeItem && (
+            <div className="indicator-item indicator-top">
+              <button
+                aria-label="Remove file"
+                className="btn btn-neutral btn-sm w-4 h-4 p-0 rounded-full"
+                onClick={() => removeItem(i)}
+              >
+                <XMarkIcon className="h-3 w-3" />
+              </button>
+            </div>
+          )}
+
+          <div
+            className={classNames({
+              'flex flex-row rounded-md shadow-sm items-center m-0 p-0': true,
+              'cursor-pointer hover:shadow-md': !!clickToShow,
+            })}
+          >
+            {item.type === 'imageFile' ? (
+              <>
+                <img
+                  src={item.base64Url}
+                  alt={`Preview image for ${item.name}`}
+                  className="w-14 h-14 object-cover rounded-md"
+                />
+              </>
+            ) : (
+              <>
+                <div
+                  className="w-14 h-14 flex items-center justify-center"
+                  aria-description="Document icon"
+                >
+                  {item.type === 'audioFile' ? (
+                    <SpeakerWaveIcon className="h-8 w-8 text-gray-500" />
+                  ) : (
+                    <DocumentTextIcon className="h-8 w-8 text-gray-500" />
+                  )}
+                </div>
+
+                <div className="text-xs pr-4">
+                  <b>{item.name ?? 'Extra content'}</b>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ))}
+
+      {showingItem && (
+        <dialog
+          className="modal modal-open"
+          aria-description={`Preview ${showingItem.name}`}
+        >
+          <div className="modal-box">
+            <div className="flex justify-between items-center mb-4">
+              <b>{showingItem.name ?? 'Extra content'}</b>
+              <button
+                className="btn btn-ghost btn-sm"
+                aria-label="Close preview dialog"
+              >
+                <XMarkIcon className="h-5 w-5" onClick={() => setShow(-1)} />
+              </button>
+            </div>
+            {showingItem.type === 'imageFile' ? (
+              <img
+                src={showingItem.base64Url}
+                alt={`Preview image for ${showingItem.name}`}
+              />
+            ) : showingItem.type === 'audioFile' ? (
+              <audio
+                controls
+                className="w-full"
+                aria-description={`Audio file ${showingItem.name}`}
+              >
+                <source
+                  src={`data:${showingItem.mimeType};base64,${showingItem.base64Data}`}
+                  type={showingItem.mimeType}
+                  aria-description={`Audio file ${showingItem.name}`}
+                />
+                Your browser does not support the audio element.
+              </audio>
+            ) : (
+              <div className="overflow-x-auto">
+                <pre className="whitespace-pre-wrap break-words text-sm">
+                  {showingItem.content}
+                </pre>
+              </div>
+            )}
+          </div>
+          <div className="modal-backdrop" onClick={() => setShow(-1)}></div>
+        </dialog>
+      )}
+    </div>
+  );
+}
+
+# ChatMessage.tsx
+-----
+import { useMemo, useState } from 'react';
+import { useAppContext } from '../utils/app.context';
+import { Message, PendingMessage } from '../utils/types';
+import { classNames } from '../utils/misc';
+import MarkdownDisplay, { CopyButton } from './MarkdownDisplay';
+import {
+  ArrowPathIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  PencilSquareIcon,
+} from '@heroicons/react/24/outline';
+import ChatInputExtraContextItem from './ChatInputExtraContextItem';
+import { BtnWithTooltips } from '../utils/common';
+
+interface SplitMessage {
+  content: PendingMessage['content'];
+  thought?: string;
+  isThinking?: boolean;
+}
+
+export default function ChatMessage({
+  msg,
+  siblingLeafNodeIds,
+  siblingCurrIdx,
+  id,
+  onRegenerateMessage,
+  onEditMessage,
+  onChangeSibling,
+  isPending,
+}: {
+  msg: Message | PendingMessage;
+  siblingLeafNodeIds: Message['id'][];
+  siblingCurrIdx: number;
+  id?: string;
+  onRegenerateMessage(msg: Message): void;
+  onEditMessage(msg: Message, content: string): void;
+  onChangeSibling(sibling: Message['id']): void;
+  isPending?: boolean;
+}) {
+  const { viewingChat, config } = useAppContext();
+  const [editingContent, setEditingContent] = useState<string | null>(null);
+  const timings = useMemo(
+    () =>
+      msg.timings
+        ? {
+            ...msg.timings,
+            prompt_per_second:
+              (msg.timings.prompt_n / msg.timings.prompt_ms) * 1000,
+            predicted_per_second:
+              (msg.timings.predicted_n / msg.timings.predicted_ms) * 1000,
+          }
+        : null,
+    [msg.timings]
+  );
+  const nextSibling = siblingLeafNodeIds[siblingCurrIdx + 1];
+  const prevSibling = siblingLeafNodeIds[siblingCurrIdx - 1];
+
+  // for reasoning model, we split the message into content and thought
+  // TODO: implement this as remark/rehype plugin in the future
+  const { content, thought, isThinking }: SplitMessage = useMemo(() => {
+    if (msg.content === null || msg.role !== 'assistant') {
+      return { content: msg.content };
+    }
+    const REGEX_THINK_OPEN = /<think>|<\|channel\|>analysis<\|message\|>/;
+    const REGEX_THINK_CLOSE = /<\/think>|<\|end\|>/;
+    let actualContent = '';
+    let thought = '';
+    let isThinking = false;
+    let thinkSplit = msg.content.split(REGEX_THINK_OPEN, 2);
+    actualContent += thinkSplit[0];
+    while (thinkSplit[1] !== undefined) {
+      // <think> tag found
+      thinkSplit = thinkSplit[1].split(REGEX_THINK_CLOSE, 2);
+      thought += thinkSplit[0];
+      isThinking = true;
+      if (thinkSplit[1] !== undefined) {
+        // </think> closing tag found
+        isThinking = false;
+        thinkSplit = thinkSplit[1].split(REGEX_THINK_OPEN, 2);
+        actualContent += thinkSplit[0];
+      }
+    }
+    return { content: actualContent, thought, isThinking };
+  }, [msg]);
+
+  if (!viewingChat) return null;
+
+  const isUser = msg.role === 'user';
+
+  return (
+    <div
+      className="group"
+      id={id}
+      role="group"
+      aria-description={`Message from ${msg.role}`}
+    >
+      <div
+        className={classNames({
+          chat: true,
+          'chat-start': !isUser,
+          'chat-end': isUser,
+        })}
+      >
+        {msg.extra && msg.extra.length > 0 && (
+          <ChatInputExtraContextItem items={msg.extra} clickToShow />
+        )}
+
+        <div
+          className={classNames({
+            'chat-bubble markdown': true,
+            'chat-bubble bg-transparent': !isUser,
+          })}
+        >
+          {/* textarea for editing message */}
+          {editingContent !== null && (
+            <>
+              <textarea
+                dir="auto"
+                className="textarea textarea-bordered bg-base-100 text-base-content max-w-2xl w-[calc(90vw-8em)] h-24"
+                value={editingContent}
+                onChange={(e) => setEditingContent(e.target.value)}
+              ></textarea>
+              <br />
+              <button
+                className="btn btn-ghost mt-2 mr-2"
+                onClick={() => setEditingContent(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn mt-2"
+                onClick={() => {
+                  if (msg.content !== null) {
+                    setEditingContent(null);
+                    onEditMessage(msg as Message, editingContent);
+                  }
+                }}
+              >
+                Submit
+              </button>
+            </>
+          )}
+          {/* not editing content, render message */}
+          {editingContent === null && (
+            <>
+              {content === null ? (
+                <>
+                  {/* show loading dots for pending message */}
+                  <span className="loading loading-dots loading-md"></span>
+                </>
+              ) : (
+                <>
+                  {/* render message as markdown */}
+                  <div dir="auto" tabIndex={0}>
+                    {thought && (
+                      <ThoughtProcess
+                        isThinking={!!isThinking && !!isPending}
+                        content={thought}
+                        open={config.showThoughtInProgress}
+                      />
+                    )}
+
+                    <MarkdownDisplay
+                      content={content}
+                      isGenerating={isPending}
+                    />
+                  </div>
+                </>
+              )}
+              {/* render timings if enabled */}
+              {timings && config.showTokensPerSecond && (
+                <div className="dropdown dropdown-hover dropdown-top mt-2">
+                  <div
+                    tabIndex={0}
+                    role="button"
+                    className="cursor-pointer font-semibold text-sm opacity-60"
+                  >
+                    Speed: {timings.predicted_per_second.toFixed(1)} t/s
+                  </div>
+                  <div className="dropdown-content bg-base-100 z-10 w-64 p-2 shadow mt-4">
+                    <b>Prompt</b>
+                    <br />- Tokens: {timings.prompt_n}
+                    <br />- Time: {timings.prompt_ms} ms
+                    <br />- Speed: {timings.prompt_per_second.toFixed(1)} t/s
+                    <br />
+                    <b>Generation</b>
+                    <br />- Tokens: {timings.predicted_n}
+                    <br />- Time: {timings.predicted_ms} ms
+                    <br />- Speed: {timings.predicted_per_second.toFixed(1)} t/s
+                    <br />
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* actions for each message */}
+      {msg.content !== null && (
+        <div
+          className={classNames({
+            'flex items-center gap-2 mx-4 mt-2 mb-2': true,
+            'flex-row-reverse': msg.role === 'user',
+          })}
+        >
+          {siblingLeafNodeIds && siblingLeafNodeIds.length > 1 && (
+            <div
+              className="flex gap-1 items-center opacity-60 text-sm"
+              role="navigation"
+              aria-description={`Message version ${siblingCurrIdx + 1} of ${siblingLeafNodeIds.length}`}
+            >
+              <button
+                className={classNames({
+                  'btn btn-sm btn-ghost p-1': true,
+                  'opacity-20': !prevSibling,
+                })}
+                onClick={() => prevSibling && onChangeSibling(prevSibling)}
+                aria-label="Previous message version"
+              >
+                <ChevronLeftIcon className="h-4 w-4" />
+              </button>
+              <span>
+                {siblingCurrIdx + 1} / {siblingLeafNodeIds.length}
+              </span>
+              <button
+                className={classNames({
+                  'btn btn-sm btn-ghost p-1': true,
+                  'opacity-20': !nextSibling,
+                })}
+                onClick={() => nextSibling && onChangeSibling(nextSibling)}
+                aria-label="Next message version"
+              >
+                <ChevronRightIcon className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+          {/* user message */}
+          {msg.role === 'user' && (
+            <BtnWithTooltips
+              className="btn-mini w-8 h-8"
+              onClick={() => setEditingContent(msg.content)}
+              disabled={msg.content === null}
+              tooltipsContent="Edit message"
+            >
+              <PencilSquareIcon className="h-4 w-4" />
+            </BtnWithTooltips>
+          )}
+          {/* assistant message */}
+          {msg.role === 'assistant' && (
+            <>
+              {!isPending && (
+                <BtnWithTooltips
+                  className="btn-mini w-8 h-8"
+                  onClick={() => {
+                    if (msg.content !== null) {
+                      onRegenerateMessage(msg as Message);
+                    }
+                  }}
+                  disabled={msg.content === null}
+                  tooltipsContent="Regenerate response"
+                >
+                  <ArrowPathIcon className="h-4 w-4" />
+                </BtnWithTooltips>
+              )}
+            </>
+          )}
+          <CopyButton className="btn-mini w-8 h-8" content={msg.content} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ThoughtProcess({
+  isThinking,
+  content,
+  open,
+}: {
+  isThinking: boolean;
+  content: string;
+  open: boolean;
+}) {
+  return (
+    <div
+      role="button"
+      aria-label="Toggle thought process display"
+      tabIndex={0}
+      className={classNames({
+        'collapse bg-none': true,
+      })}
+    >
+      <input type="checkbox" defaultChecked={open} />
+      <div className="collapse-title px-0">
+        <div className="btn rounded-xl">
+          {isThinking ? (
+            <span>
+              <span
+                className="loading loading-spinner loading-md mr-2"
+                style={{ verticalAlign: 'middle' }}
+              ></span>
+              Thinking
+            </span>
+          ) : (
+            <>Thought Process</>
+          )}
+        </div>
+      </div>
+      <div
+        className="collapse-content text-base-content/70 text-sm p-1"
+        tabIndex={0}
+        aria-description="Thought process content"
+      >
+        <div className="border-l-2 border-base-content/20 pl-4 mb-4">
+          <MarkdownDisplay content={content} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# ChatScreen.tsx
+-----
+import { ClipboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { CallbackGeneratedChunk, useAppContext } from '../utils/app.context';
+import ChatMessage from './ChatMessage';
+import { CanvasType, Message, PendingMessage } from '../utils/types';
+import { classNames, cleanCurrentUrl } from '../utils/misc';
+import CanvasPyInterpreter from './CanvasPyInterpreter';
+import StorageUtils from '../utils/storage';
+import { useVSCodeContext } from '../utils/llama-vscode';
+import { useChatTextarea, ChatTextareaApi } from './useChatTextarea.ts';
+import {
+  ArrowUpIcon,
+  StopIcon,
+  PaperClipIcon,
+} from '@heroicons/react/24/solid';
+import {
+  ChatExtraContextApi,
+  useChatExtraContext,
+} from './useChatExtraContext.tsx';
+import Dropzone from 'react-dropzone';
+import toast from 'react-hot-toast';
+import ChatInputExtraContextItem from './ChatInputExtraContextItem.tsx';
+import { scrollToBottom, useChatScroll } from './useChatScroll.tsx';
+import { MODELS_ENDPOINT } from '../Config';
+
+export interface MessageDisplay {
+  msg: Message | PendingMessage;
+  siblingLeafNodeIds: Message['id'][];
+  siblingCurrIdx: number;
+  isPending?: boolean;
+}
+
+const prefilledMsg = {
+  content() {
+    const url = new URL(window.location.href);
+    return url.searchParams.get('m') ?? url.searchParams.get('q') ?? '';
+  },
+  shouldSend() {
+    const url = new URL(window.location.href);
+    return url.searchParams.has('q');
+  },
+  clear() {
+    cleanCurrentUrl(['m', 'q']);
+  },
+};
+
+function getListMessageDisplay(
+  msgs: Readonly<Message[]>,
+  leafNodeId: Message['id']
+): MessageDisplay[] {
+  const currNodes = StorageUtils.filterByLeafNodeId(msgs, leafNodeId, true);
+  const res: MessageDisplay[] = [];
+  const nodeMap = new Map<Message['id'], Message>();
+  for (const msg of msgs) {
+    nodeMap.set(msg.id, msg);
+  }
+  const findLeafNode = (msgId: Message['id']): Message['id'] => {
+    let currNode: Message | undefined = nodeMap.get(msgId);
+    while (currNode) {
+      if (currNode.children.length === 0) break;
+      currNode = nodeMap.get(currNode.children.at(-1) ?? -1);
+    }
+    return currNode?.id ?? -1;
+  };
+  for (const msg of currNodes) {
+    const parentNode = nodeMap.get(msg.parent ?? -1);
+    if (!parentNode) continue;
+    const siblings = parentNode.children;
+    if (msg.type !== 'root') {
+      res.push({
+        msg,
+        siblingLeafNodeIds: siblings.map(findLeafNode),
+        siblingCurrIdx: siblings.indexOf(msg.id),
+      });
+    }
+  }
+  return res;
+}
+
+export default function ChatScreen() {
+  const {
+    viewingChat,
+    sendMessage,
+    isGenerating,
+    stopGenerating,
+    pendingMessages,
+    canvasData,
+    replaceMessageAndGenerate,
+  } = useAppContext();
+
+  const textarea: ChatTextareaApi = useChatTextarea(prefilledMsg.content());
+  const extraContext = useChatExtraContext();
+  useVSCodeContext(textarea, extraContext);
+
+  const msgListRef = useRef<HTMLDivElement>(null);
+  useChatScroll(msgListRef);
+
+  const [currNodeId, setCurrNodeId] = useState<number>(-1);
+  const messages: MessageDisplay[] = useMemo(() => {
+    if (!viewingChat) return [];
+    else return getListMessageDisplay(viewingChat.messages, currNodeId);
+  }, [currNodeId, viewingChat]);
+
+  const currConvId = viewingChat?.conv.id ?? null;
+  const pendingMsg: PendingMessage | undefined =
+    pendingMessages[currConvId ?? ''];
+
+  useEffect(() => {
+    setCurrNodeId(-1);
+    scrollToBottom(false, 1);
+  }, [currConvId]);
+
+  const onChunk: CallbackGeneratedChunk = (currLeafNodeId?: Message['id']) => {
+    if (currLeafNodeId) {
+      setCurrNodeId(currLeafNodeId);
+    }
+  };
+
+  const sendNewMessage = async () => {
+    const lastInpMsg = textarea.value();
+    if (lastInpMsg.trim().length === 0 || isGenerating(currConvId ?? '')) {
+      toast.error('Please enter a message');
+      return;
+    }
+    textarea.setValue('');
+    scrollToBottom(false);
+    setCurrNodeId(-1);
+    const lastMsgNodeId = messages.at(-1)?.msg.id ?? null;
+    if (
+      !(await sendMessage(
+        currConvId,
+        lastMsgNodeId,
+        lastInpMsg,
+        extraContext.items,
+        onChunk
+      ))
+    ) {
+      textarea.setValue(lastInpMsg);
+    }
+    extraContext.clearItems();
+  };
+
+  textarea.refOnSubmit.current = sendNewMessage;
+
+  const handleEditMessage = async (msg: Message, content: string) => {
+    if (!viewingChat) return;
+    setCurrNodeId(msg.id);
+    scrollToBottom(false);
+    await replaceMessageAndGenerate(
+      viewingChat.conv.id,
+      msg.parent,
+      content,
+      msg.extra,
+      onChunk
+    );
+    setCurrNodeId(-1);
+    scrollToBottom(false);
+  };
+
+  const handleRegenerateMessage = async (msg: Message) => {
+    if (!viewingChat) return;
+    setCurrNodeId(msg.parent);
+    scrollToBottom(false);
+    await replaceMessageAndGenerate(
+      viewingChat.conv.id,
+      msg.parent,
+      null,
+      msg.extra,
+      onChunk
+    );
+    setCurrNodeId(-1);
+    scrollToBottom(false);
+  };
+
+  const hasCanvas = !!canvasData;
+
+  useEffect(() => {
+    if (prefilledMsg.shouldSend()) {
+      sendNewMessage();
+    } else {
+      textarea.focus();
+    }
+    prefilledMsg.clear();
+  }, [textarea.ref]);
+
+  const pendingMsgDisplay: MessageDisplay[] =
+    pendingMsg && messages.at(-1)?.msg.id !== pendingMsg.id
+      ? [
+          {
+            msg: pendingMsg,
+            siblingLeafNodeIds: [],
+            siblingCurrIdx: 0,
+            isPending: true,
+          },
+        ]
+      : [];
+
+  return (
+    <div
+      className={classNames({
+        'grid lg:gap-8 grow transition-[300ms]': true,
+        'grid-cols-[1fr_0fr] lg:grid-cols-[1fr_1fr]': hasCanvas,
+        'grid-cols-[1fr_0fr]': !hasCanvas,
+      })}
+    >
+      <div
+        className={classNames({
+          'flex flex-col w-full max-w-[900px] mx-auto': true,
+          'hidden lg:flex': hasCanvas,
+          flex: !hasCanvas,
+        })}
+      >
+        <div id="messages-list" className="grow" ref={msgListRef}>
+          <div className="flex flex-col items-center pt-32">
+            {viewingChat ? (
+              ''
+            ) : (
+              <>
+                <div className="mb-4">
+                  Welcome to Warrior Chat - Send a message to start
+                </div>
+                <ServerInfo />
+              </>
+            )}
+          </div>
+          {[...messages, ...pendingMsgDisplay].map((msg) => (
+            <ChatMessage
+              key={msg.msg.id}
+              msg={msg.msg}
+              siblingLeafNodeIds={msg.siblingLeafNodeIds}
+              siblingCurrIdx={msg.siblingCurrIdx}
+              onRegenerateMessage={handleRegenerateMessage}
+              onEditMessage={handleEditMessage}
+              onChangeSibling={setCurrNodeId}
+              isPending={msg.isPending}
+            />
+          ))}
+        </div>
+        <ChatInput
+          textarea={textarea}
+          extraContext={extraContext}
+          onSend={sendNewMessage}
+          onStop={() => stopGenerating(currConvId ?? '')}
+          isGenerating={isGenerating(currConvId ?? '')}
+        />
+      </div>
+      <div className="w-full sticky top-[7em] h-[calc(100vh-9em)]">
+        {canvasData?.type === CanvasType.PY_INTERPRETER && (
+          <CanvasPyInterpreter />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ServerInfo() {
+  const { serverProps } = useAppContext();
+  const [displayName, setDisplayName] = useState<string>('Unknown');
+  const [status, setStatus] = useState<'ready' | 'not ready'>('not ready');
+
+  useEffect(() => {
+    async function fetchModelsAndCheck() {
+      try {
+        const resp = await fetch(MODELS_ENDPOINT);
+        if (!resp.ok) return;
+        const json = await resp.json();
+        const models = json.data || [];
+
+        // Get the filename stem from serverProps.model_path
+        const short =
+          serverProps?.model_path
+            ?.split(/(\\|\/)/)
+            .pop()
+            ?.replace(/\.(gguf|safetensors|bin)$/, '') || '';
+
+        // Try to find a match in the enriched model list
+        const match = models.find(
+          (m: any) =>
+            m.name === short ||
+            m.display_name === short ||
+            (serverProps?.model_path &&
+              m.runtime?.args?.some(
+                (a: string) =>
+                  typeof a === 'string' && serverProps.model_path.includes(a)
+              ))
+        );
+
+        if (match) {
+          setDisplayName(match.display_name || match.name);
+          // If we also got serverProps.build_info, that means llama-server responded → mark Ready
+          setStatus(serverProps?.build_info ? 'ready' : 'not ready');
+        } else {
+          setDisplayName(short || 'Unknown');
+          setStatus('not ready');
+        }
+      } catch (e) {
+        console.error('Failed to fetch enriched model names', e);
+        setDisplayName('Unknown');
+        setStatus('not ready');
+      }
+    }
+
+    if (serverProps?.model_path) {
+      fetchModelsAndCheck();
+    }
+  }, [serverProps?.model_path, serverProps?.build_info]);
+
+  const modalities: string[] = [];
+  if (serverProps?.modalities?.audio) modalities.push('audio');
+  if (serverProps?.modalities?.vision) modalities.push('vision');
+
+  return (
+    <div
+      className="card card-sm shadow-sm border-1 border-base-content/20 text-base-content/70 mb-6"
+      tabIndex={0}
+      aria-description="Server information"
+    >
+      <div className="card-body">
+        <b>Server Info</b>
+        <p>
+          <b>Model</b>: {displayName}
+          <br />
+          <b>Build</b>: {serverProps?.build_info || 'N/A'}
+          <br />
+          <b>Status</b>:{' '}
+          <span
+            className={status === 'ready' ? 'text-green-500' : 'text-red-500'}
+          >
+            {status === 'ready' ? 'Ready' : 'Not Ready'}
+          </span>
+          <br />
+          {modalities.length > 0 && (
+            <>
+              <b>Supported modalities:</b> {modalities.join(', ')}
+            </>
+          )}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function ChatInput({
+  textarea,
+  extraContext,
+  onSend,
+  onStop,
+  isGenerating,
+}: {
+  textarea: ChatTextareaApi;
+  extraContext: ChatExtraContextApi;
+  onSend: () => void;
+  onStop: () => void;
+  isGenerating: boolean;
+}) {
+  const { config } = useAppContext();
+  const [isDrag, setIsDrag] = useState(false);
+
+  return (
+    <div
+      role="group"
+      aria-label="Chat input"
+      className={classNames({
+        'flex items-end pt-8 pb-6 sticky bottom-0 bg-base-100': true,
+        'opacity-50': isDrag,
+      })}
+    >
+      <Dropzone
+        noClick
+        onDrop={(files: File[]) => {
+          setIsDrag(false);
+          extraContext.onFileAdded(files);
+        }}
+        onDragEnter={() => setIsDrag(true)}
+        onDragLeave={() => setIsDrag(false)}
+        multiple={true}
+      >
+        {({ getRootProps, getInputProps }) => (
+          <div
+            className="flex flex-col rounded-xl border-1 border-base-content/30 p-3 w-full"
+            onPasteCapture={(e: ClipboardEvent<HTMLInputElement>) => {
+              const text = e.clipboardData.getData('text/plain');
+              if (
+                text.length > 0 &&
+                config.pasteLongTextToFileLen > 0 &&
+                text.length > config.pasteLongTextToFileLen
+              ) {
+                extraContext.addItems([
+                  { type: 'context', name: 'Pasted Content', content: text },
+                ]);
+                e.preventDefault();
+                return;
+              }
+              const files = Array.from(e.clipboardData.items)
+                .filter((item) => item.kind === 'file')
+                .map((item) => item.getAsFile())
+                .filter((file) => file !== null);
+              if (files.length > 0) {
+                e.preventDefault();
+                extraContext.onFileAdded(files);
+              }
+            }}
+            {...getRootProps()}
+          >
+            {!isGenerating && (
+              <ChatInputExtraContextItem
+                items={extraContext.items}
+                removeItem={extraContext.removeItem}
+              />
+            )}
+
+            <div className="flex flex-row w-full">
+              <textarea
+                className="text-md outline-none border-none w-full resize-vertical lg:resize-none lg:max-h-48 lg:overflow-y-auto"
+                placeholder="Type a message (Shift+Enter to add a new line)"
+                ref={textarea.ref}
+                onInput={textarea.onInput}
+                onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    onSend();
+                  }
+                }}
+                id="msg-input"
+                dir="auto"
+                rows={2}
+              ></textarea>
+              <div className="flex flex-row gap-2 ml-2">
+                <label
+                  htmlFor="file-upload"
+                  className={classNames({
+                    'btn w-8 h-8 p-0 rounded-full': true,
+                    'btn-disabled': isGenerating,
+                  })}
+                  aria-label="Upload file"
+                  tabIndex={0}
+                  role="button"
+                >
+                  <PaperClipIcon className="h-5 w-5" />
+                </label>
+                <input
+                  id="file-upload"
+                  type="file"
+                  disabled={isGenerating}
+                  {...getInputProps()}
+                  hidden
+                />
+                {isGenerating ? (
+                  <button
+                    className="btn btn-neutral w-8 h-8 p-0 rounded-full"
+                    onClick={onStop}
+                  >
+                    <StopIcon className="h-5 w-5" />
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-primary w-8 h-8 p-0 rounded-full"
+                    onClick={onSend}
+                    aria-label="Send message"
+                  >
+                    <ArrowUpIcon className="h-5 w-5" />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </Dropzone>
+    </div>
+  );
+}
+
+# Header.tsx
+-----
+import { useEffect, useState } from 'react';
+import StorageUtils from '../utils/storage';
+import { useAppContext } from '../utils/app.context';
+import { classNames } from '../utils/misc';
+import daisyuiThemes from 'daisyui/theme/object';
+import { THEMES, MODELS_ENDPOINT } from '../Config';
+import {
+  Cog8ToothIcon,
+  MoonIcon,
+  Bars3Icon,
+} from '@heroicons/react/24/outline';
+
+type ApiModel = { name: string; display_name?: string; type?: string };
+
+const SELECTED_MODEL_KEY = 'warriorgpt.selectedModel';
+
+export default function Header() {
+  const [selectedTheme, setSelectedTheme] = useState(StorageUtils.getTheme());
+  const { setShowSettings } = useAppContext();
+
+  const [models, setModels] = useState<ApiModel[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>(
+    localStorage.getItem(SELECTED_MODEL_KEY) || ''
+  );
+
+  const setTheme = (theme: string) => {
+    StorageUtils.setTheme(theme);
+    setSelectedTheme(theme);
+  };
+
+  // apply theme to <body>
+  useEffect(() => {
+    document.body.setAttribute('data-theme', selectedTheme);
+    document.body.setAttribute(
+      'data-color-scheme',
+      daisyuiThemes[selectedTheme]?.['color-scheme'] ?? 'auto'
+    );
+  }, [selectedTheme]);
+
+  // fetch models once
+  // fetch models once
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(MODELS_ENDPOINT);
+        if (!resp.ok) throw new Error(`Failed to fetch models: ${resp.status}`);
+        const raw = await resp.json();
+
+        let arr: ApiModel[] = [];
+        if (raw && Array.isArray(raw.data)) {
+          arr = raw.data.map((m: any) => ({
+            name: m.name,
+            display_name: m.display_name || m.name,
+            type: m.type || 'openai',
+          }));
+        }
+
+        if (cancelled) return;
+        setModels(arr);
+
+        if (!selectedModel && arr.length > 0) {
+          const first = arr[0].name;
+          setSelectedModel(first);
+          localStorage.setItem(SELECTED_MODEL_KEY, first);
+          window.dispatchEvent(
+            new CustomEvent('warriorgpt:model-changed', { detail: first })
+          );
+        }
+      } catch (err) {
+        console.error('Failed to load models in Header', err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleChangeModel = (name: string) => {
+    setSelectedModel(name);
+    localStorage.setItem(SELECTED_MODEL_KEY, name);
+    window.dispatchEvent(
+      new CustomEvent('warriorgpt:model-changed', { detail: name })
+    );
+  };
+
+  return (
+    <div className="flex flex-row items-center pt-6 pb-6 sticky top-0 z-10 bg-base-100">
+      {/* open sidebar button */}
+      <label
+        htmlFor="toggle-drawer"
+        className="btn btn-ghost lg:hidden"
+        aria-label="Open sidebar"
+      >
+        <Bars3Icon className="h-5 w-5" />
+      </label>
+
+      {/* App title */}
+      <div className="grow flex items-center text-2xl font-bold ml-2">
+        <img src="/wgpt-logo.png" alt="Logo" className="h-28 w-auto mr-3" />
+        <span>WarriorGPT</span>
+      </div>
+
+      {/* Model selector */}
+      <div className="mr-3 hidden sm:flex items-center gap-2">
+        <span className="text-sm opacity-70">Model</span>
+        <select
+          className="select select-sm max-w-xs"
+          value={selectedModel}
+          onChange={(e) => handleChangeModel(e.target.value)}
+          aria-label="Select model"
+        >
+          {models.map((m) => (
+            <option key={m.name} value={m.name}>
+              {m.display_name || m.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* action buttons */}
+      <div className="flex items-center">
+        <div
+          className="tooltip tooltip-bottom"
+          data-tip="Settings"
+          onClick={() => setShowSettings(true)}
+        >
+          <button className="btn" aria-hidden={true}>
+            <Cog8ToothIcon className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* theme controller */}
+        <div className="tooltip tooltip-bottom" data-tip="Themes">
+          <div className="dropdown dropdown-end dropdown-bottom">
+            <div
+              tabIndex={0}
+              role="button"
+              className="btn m-1"
+              aria-label="Theme"
+            >
+              <MoonIcon className="w-5 h-5" />
+            </div>
+            <ul
+              tabIndex={0}
+              className="dropdown-content bg-base-300 rounded-box z-[1] w-52 p-2 shadow-2xl h-80 overflow-y-auto"
+            >
+              <li>
+                <button
+                  className={classNames({
+                    'btn btn-sm btn-block btn-ghost justify-start': true,
+                    'btn-active': selectedTheme === 'auto',
+                  })}
+                  onClick={() => setTheme('auto')}
+                >
+                  auto
+                </button>
+              </li>
+              {THEMES.map((theme) => (
+                <li key={theme}>
+                  <input
+                    type="radio"
+                    name="theme-dropdown"
+                    className="theme-controller btn btn-sm btn-block btn-ghost justify-start"
+                    aria-label={theme}
+                    value={theme}
+                    checked={selectedTheme === theme}
+                    onChange={(e) => e.target.checked && setTheme(theme)}
+                  />
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+# MarkdownDisplay.tsx
+-----
+import React, { useMemo, useState } from 'react';
+import Markdown, { ExtraProps } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHightlight from 'rehype-highlight';
+import rehypeKatex from 'rehype-katex';
+import remarkMath from 'remark-math';
+import remarkBreaks from 'remark-breaks';
+import 'katex/dist/katex.min.css';
+import { classNames, copyStr } from '../utils/misc';
+import { ElementContent, Root } from 'hast';
+import { visit } from 'unist-util-visit';
+import { useAppContext } from '../utils/app.context';
+import { CanvasType } from '../utils/types';
+import { BtnWithTooltips } from '../utils/common';
+import { DocumentDuplicateIcon, PlayIcon } from '@heroicons/react/24/outline';
+
+export default function MarkdownDisplay({
+  content,
+  isGenerating,
+}: {
+  content: string;
+  isGenerating?: boolean;
+}) {
+  const preprocessedContent = useMemo(
+    () => preprocessLaTeX(content),
+    [content]
+  );
+  return (
+    <Markdown
+      remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
+      rehypePlugins={[rehypeHightlight, rehypeKatex, rehypeCustomCopyButton]}
+      components={{
+        button: (props) => (
+          <CodeBlockButtons
+            {...props}
+            isGenerating={isGenerating}
+            origContent={preprocessedContent}
+          />
+        ),
+        // note: do not use "pre", "p" or other basic html elements here, it will cause the node to re-render when the message is being generated (this should be a bug with react-markdown, not sure how to fix it)
+      }}
+    >
+      {preprocessedContent}
+    </Markdown>
+  );
+}
+
+const CodeBlockButtons: React.ElementType<
+  React.ClassAttributes<HTMLButtonElement> &
+    React.HTMLAttributes<HTMLButtonElement> &
+    ExtraProps & { origContent: string; isGenerating?: boolean }
+> = ({ node, origContent, isGenerating }) => {
+  const { config } = useAppContext();
+  const startOffset = node?.position?.start.offset ?? 0;
+  const endOffset = node?.position?.end.offset ?? 0;
+
+  const copiedContent = useMemo(
+    () =>
+      origContent
+        .substring(startOffset, endOffset)
+        .replace(/^```[^\n]+\n/g, '')
+        .replace(/```$/g, ''),
+    [origContent, startOffset, endOffset]
+  );
+
+  const codeLanguage = useMemo(
+    () =>
+      origContent
+        .substring(startOffset, startOffset + 10)
+        .match(/^```([^\n]+)\n/)?.[1] ?? '',
+    [origContent, startOffset]
+  );
+
+  const canRunCode =
+    !isGenerating &&
+    config.pyIntepreterEnabled &&
+    codeLanguage.startsWith('py');
+
+  return (
+    <div
+      className={classNames({
+        'text-right sticky top-[7em] mb-2 mr-2 h-0': true,
+        'display-none': !node?.position,
+      })}
+    >
+      <CopyButton
+        className="badge btn-mini btn-soft shadow-sm"
+        content={copiedContent}
+      />
+      {canRunCode && (
+        <RunPyCodeButton
+          className="badge btn-mini shadow-sm ml-2"
+          content={copiedContent}
+        />
+      )}
+    </div>
+  );
+};
+
+export const CopyButton = ({
+  content,
+  className,
+}: {
+  content: string;
+  className?: string;
+}) => {
+  const [copied, setCopied] = useState(false);
+  return (
+    <BtnWithTooltips
+      className={className}
+      onClick={() => {
+        copyStr(content);
+        setCopied(true);
+      }}
+      onMouseLeave={() => setCopied(false)}
+      tooltipsContent={copied ? 'Copied!' : 'Copy'}
+    >
+      <DocumentDuplicateIcon className="h-4 w-4" />
+    </BtnWithTooltips>
+  );
+};
+
+export const RunPyCodeButton = ({
+  content,
+  className,
+}: {
+  content: string;
+  className?: string;
+}) => {
+  const { setCanvasData } = useAppContext();
+  return (
+    <>
+      <BtnWithTooltips
+        className={className}
+        onClick={() =>
+          setCanvasData({
+            type: CanvasType.PY_INTERPRETER,
+            content,
+          })
+        }
+        tooltipsContent="Run code"
+      >
+        <PlayIcon className="h-4 w-4" />
+      </BtnWithTooltips>
+    </>
+  );
+};
+
+/**
+ * This injects the "button" element before each "pre" element.
+ * The actual button will be replaced with a react component in the MarkdownDisplay.
+ * We don't replace "pre" node directly because it will cause the node to re-render, which causes this bug: https://github.com/ggerganov/llama.cpp/issues/9608
+ */
+function rehypeCustomCopyButton() {
+  return function (tree: Root) {
+    visit(tree, 'element', function (node) {
+      if (node.tagName === 'pre' && !node.properties.visited) {
+        const preNode = { ...node };
+        // replace current node
+        preNode.properties.visited = 'true';
+        node.tagName = 'div';
+        node.properties = {};
+        // add node for button
+        const btnNode: ElementContent = {
+          type: 'element',
+          tagName: 'button',
+          properties: {},
+          children: [],
+          position: node.position,
+        };
+        node.children = [btnNode, preNode];
+      }
+    });
+  };
+}
+
+/**
+ * The part below is copied and adapted from:
+ * https://github.com/danny-avila/LibreChat/blob/main/client/src/utils/latex.ts
+ * (MIT License)
+ */
+
+// Regex to check if the processed content contains any potential LaTeX patterns
+const containsLatexRegex =
+  /\\\(.*?\\\)|\\\[.*?\\\]|\$.*?\$|\\begin\{equation\}.*?\\end\{equation\}/;
+
+// Regex for inline and block LaTeX expressions
+const inlineLatex = new RegExp(/\\\((.+?)\\\)/, 'g');
+const blockLatex = new RegExp(/\\\[(.*?[^\\])\\\]/, 'gs');
+
+// Function to restore code blocks
+const restoreCodeBlocks = (content: string, codeBlocks: string[]) => {
+  return content.replace(
+    /<<CODE_BLOCK_(\d+)>>/g,
+    (_, index) => codeBlocks[index]
+  );
+};
+
+// Regex to identify code blocks and inline code
+const codeBlockRegex = /(```[\s\S]*?```|`.*?`)/g;
+
+export const processLaTeX = (_content: string) => {
+  let content = _content;
+  // Temporarily replace code blocks and inline code with placeholders
+  const codeBlocks: string[] = [];
+  let index = 0;
+  content = content.replace(codeBlockRegex, (match) => {
+    codeBlocks[index] = match;
+    return `<<CODE_BLOCK_${index++}>>`;
+  });
+
+  // Escape dollar signs followed by a digit or space and digit
+  let processedContent = content.replace(/(\$)(?=\s?\d)/g, '\\$');
+
+  // If no LaTeX patterns are found, restore code blocks and return the processed content
+  if (!containsLatexRegex.test(processedContent)) {
+    return restoreCodeBlocks(processedContent, codeBlocks);
+  }
+
+  // Convert LaTeX expressions to a markdown compatible format
+  processedContent = processedContent
+    .replace(inlineLatex, (_: string, equation: string) => `$${equation}$`) // Convert inline LaTeX
+    .replace(blockLatex, (_: string, equation: string) => `$$${equation}$$`); // Convert block LaTeX
+
+  // Restore code blocks
+  return restoreCodeBlocks(processedContent, codeBlocks);
+};
+
+/**
+ * Preprocesses LaTeX content by replacing delimiters and escaping certain characters.
+ *
+ * @param content The input string containing LaTeX expressions.
+ * @returns The processed string with replaced delimiters and escaped characters.
+ */
+export function preprocessLaTeX(content: string): string {
+  // Step 1: Protect code blocks
+  const codeBlocks: string[] = [];
+  content = content.replace(/(```[\s\S]*?```|`[^`\n]+`)/g, (_, code) => {
+    codeBlocks.push(code);
+    return `<<CODE_BLOCK_${codeBlocks.length - 1}>>`;
+  });
+
+  // Step 2: Protect existing LaTeX expressions
+  const latexExpressions: string[] = [];
+
+  // Protect block math ($$...$$), \[...\], and \(...\) as before.
+  content = content.replace(
+    /(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\(.*?\\\))/g,
+    (match) => {
+      latexExpressions.push(match);
+      return `<<LATEX_${latexExpressions.length - 1}>>`;
+    }
+  );
+
+  // Protect inline math ($...$) only if it does NOT match a currency pattern.
+  // We assume a currency pattern is one where the inner content is purely numeric (with optional decimals).
+  content = content.replace(/\$([^$]+)\$/g, (match, inner) => {
+    if (/^\s*\d+(?:\.\d+)?\s*$/.test(inner)) {
+      // This looks like a currency value (e.g. "$123" or "$12.34"),
+      // so don't protect it.
+      return match;
+    } else {
+      // Otherwise, treat it as a LaTeX expression.
+      latexExpressions.push(match);
+      return `<<LATEX_${latexExpressions.length - 1}>>`;
+    }
+  });
+
+  // Step 3: Escape dollar signs that are likely currency indicators.
+  // (Now that inline math is protected, this will only escape dollars not already protected)
+  content = content.replace(/\$(?=\d)/g, '\\$');
+
+  // Step 4: Restore LaTeX expressions
+  content = content.replace(
+    /<<LATEX_(\d+)>>/g,
+    (_, index) => latexExpressions[parseInt(index)]
+  );
+
+  // Step 5: Restore code blocks
+  content = content.replace(
+    /<<CODE_BLOCK_(\d+)>>/g,
+    (_, index) => codeBlocks[parseInt(index)]
+  );
+
+  // Step 6: Apply additional escaping functions
+  content = escapeBrackets(content);
+  content = escapeMhchem(content);
+
+  return content;
+}
+
+export function escapeBrackets(text: string): string {
+  const pattern =
+    /(```[\S\s]*?```|`.*?`)|\\\[([\S\s]*?[^\\])\\]|\\\((.*?)\\\)/g;
+  return text.replace(
+    pattern,
+    (
+      match: string,
+      codeBlock: string | undefined,
+      squareBracket: string | undefined,
+      roundBracket: string | undefined
+    ): string => {
+      if (codeBlock != null) {
+        return codeBlock;
+      } else if (squareBracket != null) {
+        return `$$${squareBracket}$$`;
+      } else if (roundBracket != null) {
+        return `$${roundBracket}$`;
+      }
+      return match;
+    }
+  );
+}
+
+export function escapeMhchem(text: string) {
+  return text.replaceAll('$\\ce{', '$\\\\ce{').replaceAll('$\\pu{', '$\\\\pu{');
+}
+
+# ModalProvider.tsx
+-----
+import React, { createContext, useState, useContext } from 'react';
+
+type ModalContextType = {
+  showConfirm: (message: string) => Promise<boolean>;
+  showPrompt: (
+    message: string,
+    defaultValue?: string
+  ) => Promise<string | undefined>;
+  showAlert: (message: string) => Promise<void>;
+};
+const ModalContext = createContext<ModalContextType>(null!);
+
+interface ModalState<T> {
+  isOpen: boolean;
+  message: string;
+  defaultValue?: string;
+  resolve: ((value: T) => void) | null;
+}
+
+export function ModalProvider({ children }: { children: React.ReactNode }) {
+  const [confirmState, setConfirmState] = useState<ModalState<boolean>>({
+    isOpen: false,
+    message: '',
+    resolve: null,
+  });
+  const [promptState, setPromptState] = useState<
+    ModalState<string | undefined>
+  >({ isOpen: false, message: '', resolve: null });
+  const [alertState, setAlertState] = useState<ModalState<void>>({
+    isOpen: false,
+    message: '',
+    resolve: null,
+  });
+  const inputRef = React.useRef<HTMLInputElement>(null);
+
+  const showConfirm = (message: string): Promise<boolean> => {
+    return new Promise((resolve) => {
+      setConfirmState({ isOpen: true, message, resolve });
+    });
+  };
+
+  const showPrompt = (
+    message: string,
+    defaultValue?: string
+  ): Promise<string | undefined> => {
+    return new Promise((resolve) => {
+      setPromptState({ isOpen: true, message, defaultValue, resolve });
+    });
+  };
+
+  const showAlert = (message: string): Promise<void> => {
+    return new Promise((resolve) => {
+      setAlertState({ isOpen: true, message, resolve });
+    });
+  };
+
+  const handleConfirm = (result: boolean) => {
+    confirmState.resolve?.(result);
+    setConfirmState({ isOpen: false, message: '', resolve: null });
+  };
+
+  const handlePrompt = (result?: string) => {
+    promptState.resolve?.(result);
+    setPromptState({ isOpen: false, message: '', resolve: null });
+  };
+
+  const handleAlertClose = () => {
+    alertState.resolve?.();
+    setAlertState({ isOpen: false, message: '', resolve: null });
+  };
+
+  return (
+    <ModalContext.Provider value={{ showConfirm, showPrompt, showAlert }}>
+      {children}
+
+      {/* Confirm Modal */}
+      {confirmState.isOpen && (
+        <dialog className="modal modal-open z-[1100]">
+          <div className="modal-box">
+            <h3 className="font-bold text-lg">{confirmState.message}</h3>
+            <div className="modal-action">
+              <button
+                className="btn btn-ghost"
+                onClick={() => handleConfirm(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-error"
+                onClick={() => handleConfirm(true)}
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        </dialog>
+      )}
+
+      {/* Prompt Modal */}
+      {promptState.isOpen && (
+        <dialog className="modal modal-open z-[1100]">
+          <div className="modal-box">
+            <h3 className="font-bold text-lg">{promptState.message}</h3>
+            <input
+              type="text"
+              className="input input-bordered w-full mt-2"
+              defaultValue={promptState.defaultValue}
+              ref={inputRef}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  handlePrompt((e.target as HTMLInputElement).value);
+                }
+              }}
+            />
+            <div className="modal-action">
+              <button className="btn btn-ghost" onClick={() => handlePrompt()}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => handlePrompt(inputRef.current?.value)}
+              >
+                Submit
+              </button>
+            </div>
+          </div>
+        </dialog>
+      )}
+
+      {/* Alert Modal */}
+      {alertState.isOpen && (
+        <dialog className="modal modal-open z-[1100]">
+          <div className="modal-box">
+            <h3 className="font-bold text-lg">{alertState.message}</h3>
+            <div className="modal-action">
+              <button className="btn" onClick={handleAlertClose}>
+                OK
+              </button>
+            </div>
+          </div>
+        </dialog>
+      )}
+    </ModalContext.Provider>
+  );
+}
+
+export function useModals() {
+  const context = useContext(ModalContext);
+  if (!context) throw new Error('useModals must be used within ModalProvider');
+  return context;
+}
+
+# SettingDialog.tsx
+-----
+import { useState } from 'react';
+import { useAppContext } from '../utils/app.context';
+import { CONFIG_DEFAULT, CONFIG_INFO } from '../Config';
+import { isDev } from '../Config';
+import StorageUtils from '../utils/storage';
+import { classNames, isBoolean, isNumeric, isString } from '../utils/misc';
+import {
+  BeakerIcon,
+  ChatBubbleOvalLeftEllipsisIcon,
+  Cog6ToothIcon,
+  FunnelIcon,
+  HandRaisedIcon,
+  SquaresPlusIcon,
+} from '@heroicons/react/24/outline';
+import { OpenInNewTab } from '../utils/common';
+import { useModals } from './ModalProvider';
+
+type SettKey = keyof typeof CONFIG_DEFAULT;
+
+const BASIC_KEYS: SettKey[] = [
+  'temperature',
+  'top_k',
+  'top_p',
+  'min_p',
+  'max_tokens',
+];
+const SAMPLER_KEYS: SettKey[] = [
+  'dynatemp_range',
+  'dynatemp_exponent',
+  'typical_p',
+  'xtc_probability',
+  'xtc_threshold',
+];
+const PENALTY_KEYS: SettKey[] = [
+  'repeat_last_n',
+  'repeat_penalty',
+  'presence_penalty',
+  'frequency_penalty',
+  'dry_multiplier',
+  'dry_base',
+  'dry_allowed_length',
+  'dry_penalty_last_n',
+];
+
+enum SettingInputType {
+  SHORT_INPUT,
+  LONG_INPUT,
+  CHECKBOX,
+  CUSTOM,
+}
+
+interface SettingFieldInput {
+  type: Exclude<SettingInputType, SettingInputType.CUSTOM>;
+  label: string | React.ReactElement;
+  help?: string | React.ReactElement;
+  key: SettKey;
+}
+
+interface SettingFieldCustom {
+  type: SettingInputType.CUSTOM;
+  key: SettKey;
+  component:
+    | string
+    | React.FC<{
+        value: string | boolean | number;
+        onChange: (value: string) => void;
+      }>;
+}
+
+interface SettingSection {
+  title: React.ReactElement;
+  fields: (SettingFieldInput | SettingFieldCustom)[];
+}
+
+const ICON_CLASSNAME = 'w-4 h-4 mr-1 inline';
+
+const SETTING_SECTIONS: SettingSection[] = [
+  {
+    title: (
+      <>
+        <Cog6ToothIcon className={ICON_CLASSNAME} />
+        General
+      </>
+    ),
+    fields: [
+      {
+        type: SettingInputType.SHORT_INPUT,
+        label: 'API Key',
+        key: 'apiKey',
+      },
+      {
+        type: SettingInputType.LONG_INPUT,
+        label: 'System Message (will be disabled if left empty)',
+        key: 'systemMessage',
+      },
+      ...BASIC_KEYS.map(
+        (key) =>
+          ({
+            type: SettingInputType.SHORT_INPUT,
+            label: key,
+            key,
+          }) as SettingFieldInput
+      ),
+      {
+        type: SettingInputType.SHORT_INPUT,
+        label: 'Paste length to file',
+        key: 'pasteLongTextToFileLen',
+      },
+      {
+        type: SettingInputType.CHECKBOX,
+        label: 'Parse PDF as image instead of text',
+        key: 'pdfAsImage',
+      },
+    ],
+  },
+  {
+    title: (
+      <>
+        <FunnelIcon className={ICON_CLASSNAME} />
+        Samplers
+      </>
+    ),
+    fields: [
+      {
+        type: SettingInputType.SHORT_INPUT,
+        label: 'Samplers queue',
+        key: 'samplers',
+      },
+      ...SAMPLER_KEYS.map(
+        (key) =>
+          ({
+            type: SettingInputType.SHORT_INPUT,
+            label: key,
+            key,
+          }) as SettingFieldInput
+      ),
+    ],
+  },
+  {
+    title: (
+      <>
+        <HandRaisedIcon className={ICON_CLASSNAME} />
+        Penalties
+      </>
+    ),
+    fields: PENALTY_KEYS.map((key) => ({
+      type: SettingInputType.SHORT_INPUT,
+      label: key,
+      key,
+    })),
+  },
+  {
+    title: (
+      <>
+        <ChatBubbleOvalLeftEllipsisIcon className={ICON_CLASSNAME} />
+        Reasoning
+      </>
+    ),
+    fields: [
+      {
+        type: SettingInputType.CHECKBOX,
+        label: 'Expand thought process by default when generating messages',
+        key: 'showThoughtInProgress',
+      },
+      {
+        type: SettingInputType.CHECKBOX,
+        label:
+          'Exclude thought process when sending requests to API (Recommended for DeepSeek-R1)',
+        key: 'excludeThoughtOnReq',
+      },
+    ],
+  },
+  {
+    title: (
+      <>
+        <SquaresPlusIcon className={ICON_CLASSNAME} />
+        Advanced
+      </>
+    ),
+    fields: [
+      {
+        type: SettingInputType.CUSTOM,
+        key: 'custom', // dummy key, won't be used
+        component: () => {
+          const debugImportDemoConv = async () => {
+            const res = await fetch('/demo-conversation.json');
+            const demoConv = await res.json();
+            StorageUtils.remove(demoConv.id);
+            for (const msg of demoConv.messages) {
+              StorageUtils.appendMsg(demoConv.id, msg);
+            }
+          };
+          return (
+            <button className="btn" onClick={debugImportDemoConv}>
+              (debug) Import demo conversation
+            </button>
+          );
+        },
+      },
+      {
+        type: SettingInputType.CHECKBOX,
+        label: 'Show tokens per second',
+        key: 'showTokensPerSecond',
+      },
+      {
+        type: SettingInputType.LONG_INPUT,
+        label: (
+          <>
+            Custom JSON config (For more info, refer to{' '}
+            <OpenInNewTab href="https://github.com/ggerganov/llama.cpp/blob/master/tools/server/README.md">
+              server documentation
+            </OpenInNewTab>
+            )
+          </>
+        ),
+        key: 'custom',
+      },
+    ],
+  },
+  {
+    title: (
+      <>
+        <BeakerIcon className={ICON_CLASSNAME} />
+        Experimental
+      </>
+    ),
+    fields: [
+      {
+        type: SettingInputType.CUSTOM,
+        key: 'custom', // dummy key, won't be used
+        component: () => (
+          <>
+            <p className="mb-8">
+              Experimental features are not guaranteed to work correctly.
+              <br />
+              <br />
+              If you encounter any problems, create a{' '}
+              <OpenInNewTab href="https://github.com/ggerganov/llama.cpp/issues/new?template=019-bug-misc.yml">
+                Bug (misc.)
+              </OpenInNewTab>{' '}
+              report on Github. Please also specify <b>webui/experimental</b> on
+              the report title and include screenshots.
+              <br />
+              <br />
+              Some features may require packages downloaded from CDN, so they
+              need internet connection.
+            </p>
+          </>
+        ),
+      },
+      {
+        type: SettingInputType.CHECKBOX,
+        label: (
+          <>
+            <b>Enable Python interpreter</b>
+            <br />
+            <small className="text-xs">
+              This feature uses{' '}
+              <OpenInNewTab href="https://pyodide.org">pyodide</OpenInNewTab>,
+              downloaded from CDN. To use this feature, ask the LLM to generate
+              Python code inside a Markdown code block. You will see a "Run"
+              button on the code block, near the "Copy" button.
+            </small>
+          </>
+        ),
+        key: 'pyIntepreterEnabled',
+      },
+    ],
+  },
+];
+
+export default function SettingDialog({
+  show,
+  onClose,
+}: {
+  show: boolean;
+  onClose: () => void;
+}) {
+  const { config, saveConfig } = useAppContext();
+  const [sectionIdx, setSectionIdx] = useState(0);
+
+  // clone the config object to prevent direct mutation
+  const [localConfig, setLocalConfig] = useState<typeof CONFIG_DEFAULT>(
+    JSON.parse(JSON.stringify(config))
+  );
+  const { showConfirm, showAlert } = useModals();
+
+  const resetConfig = async () => {
+    if (await showConfirm('Are you sure you want to reset all settings?')) {
+      setLocalConfig(CONFIG_DEFAULT);
+    }
+  };
+
+  const handleSave = async () => {
+    // copy the local config to prevent direct mutation
+    const newConfig: typeof CONFIG_DEFAULT = JSON.parse(
+      JSON.stringify(localConfig)
+    );
+    // validate the config
+    for (const key in newConfig) {
+      const value = newConfig[key as SettKey];
+      const mustBeBoolean = isBoolean(CONFIG_DEFAULT[key as SettKey]);
+      const mustBeString = isString(CONFIG_DEFAULT[key as SettKey]);
+      const mustBeNumeric = isNumeric(CONFIG_DEFAULT[key as SettKey]);
+      if (mustBeString) {
+        if (!isString(value)) {
+          await showAlert(`Value for ${key} must be string`);
+          return;
+        }
+      } else if (mustBeNumeric) {
+        const trimmedValue = value.toString().trim();
+        const numVal = Number(trimmedValue);
+        if (isNaN(numVal) || !isNumeric(numVal) || trimmedValue.length === 0) {
+          await showAlert(`Value for ${key} must be numeric`);
+          return;
+        }
+        // force conversion to number
+        // @ts-expect-error this is safe
+        newConfig[key] = numVal;
+      } else if (mustBeBoolean) {
+        if (!isBoolean(value)) {
+          await showAlert(`Value for ${key} must be boolean`);
+          return;
+        }
+      } else {
+        console.error(`Unknown default type for key ${key}`);
+      }
+    }
+    if (isDev) console.log('Saving config', newConfig);
+    saveConfig(newConfig);
+    onClose();
+  };
+
+  const onChange = (key: SettKey) => (value: string | boolean) => {
+    // note: we do not perform validation here, because we may get incomplete value as user is still typing it
+    setLocalConfig({ ...localConfig, [key]: value });
+  };
+
+  return (
+    <dialog
+      className={classNames({ modal: true, 'modal-open': show })}
+      aria-label="Settings dialog"
+    >
+      <div className="modal-box w-11/12 max-w-3xl">
+        <h3 className="text-lg font-bold mb-6">Settings</h3>
+        <div className="flex flex-col md:flex-row h-[calc(90vh-12rem)]">
+          {/* Left panel, showing sections - Desktop version */}
+          <div
+            className="hidden md:flex flex-col items-stretch pr-4 mr-4 border-r-2 border-base-200"
+            role="complementary"
+            aria-description="Settings sections"
+            tabIndex={0}
+          >
+            {SETTING_SECTIONS.map((section, idx) => (
+              <button
+                key={idx}
+                className={classNames({
+                  'btn btn-ghost justify-start font-normal w-44 mb-1': true,
+                  'btn-active': sectionIdx === idx,
+                })}
+                onClick={() => setSectionIdx(idx)}
+                dir="auto"
+              >
+                {section.title}
+              </button>
+            ))}
+          </div>
+
+          {/* Left panel, showing sections - Mobile version */}
+          {/* This menu is skipped on a11y, otherwise it's repeated the desktop version */}
+          <div
+            className="md:hidden flex flex-row gap-2 mb-4"
+            aria-disabled={true}
+          >
+            <details className="dropdown">
+              <summary className="btn bt-sm w-full m-1">
+                {SETTING_SECTIONS[sectionIdx].title}
+              </summary>
+              <ul className="menu dropdown-content bg-base-100 rounded-box z-[1] w-52 p-2 shadow">
+                {SETTING_SECTIONS.map((section, idx) => (
+                  <div
+                    key={idx}
+                    className={classNames({
+                      'btn btn-ghost justify-start font-normal': true,
+                      'btn-active': sectionIdx === idx,
+                    })}
+                    onClick={() => setSectionIdx(idx)}
+                    dir="auto"
+                  >
+                    {section.title}
+                  </div>
+                ))}
+              </ul>
+            </details>
+          </div>
+
+          {/* Right panel, showing setting fields */}
+          <div className="grow overflow-y-auto px-4">
+            {SETTING_SECTIONS[sectionIdx].fields.map((field, idx) => {
+              const key = `${sectionIdx}-${idx}`;
+              if (field.type === SettingInputType.SHORT_INPUT) {
+                return (
+                  <SettingsModalShortInput
+                    key={key}
+                    configKey={field.key}
+                    value={localConfig[field.key]}
+                    onChange={onChange(field.key)}
+                    label={field.label as string}
+                  />
+                );
+              } else if (field.type === SettingInputType.LONG_INPUT) {
+                return (
+                  <SettingsModalLongInput
+                    key={key}
+                    configKey={field.key}
+                    value={localConfig[field.key].toString()}
+                    onChange={onChange(field.key)}
+                    label={field.label as string}
+                  />
+                );
+              } else if (field.type === SettingInputType.CHECKBOX) {
+                return (
+                  <SettingsModalCheckbox
+                    key={key}
+                    configKey={field.key}
+                    value={!!localConfig[field.key]}
+                    onChange={onChange(field.key)}
+                    label={field.label as string}
+                  />
+                );
+              } else if (field.type === SettingInputType.CUSTOM) {
+                return (
+                  <div key={key} className="mb-2">
+                    {typeof field.component === 'string'
+                      ? field.component
+                      : field.component({
+                          value: localConfig[field.key],
+                          onChange: onChange(field.key),
+                        })}
+                  </div>
+                );
+              }
+            })}
+
+            <p className="opacity-40 mb-6 text-sm mt-8">
+              Settings are saved in browser's localStorage
+            </p>
+          </div>
+        </div>
+
+        <div className="modal-action">
+          <button className="btn" onClick={resetConfig}>
+            Reset to default
+          </button>
+          <button className="btn" onClick={onClose}>
+            Close
+          </button>
+          <button className="btn btn-primary" onClick={handleSave}>
+            Save
+          </button>
+        </div>
+      </div>
+    </dialog>
+  );
+}
+
+function SettingsModalLongInput({
+  configKey,
+  value,
+  onChange,
+  label,
+}: {
+  configKey: SettKey;
+  value: string;
+  onChange: (value: string) => void;
+  label?: string;
+}) {
+  return (
+    <label className="form-control">
+      <div className="label inline text-sm">{label || configKey}</div>
+      <textarea
+        className="textarea textarea-bordered h-24 mb-2"
+        placeholder={`Default: ${CONFIG_DEFAULT[configKey] || 'none'}`}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </label>
+  );
+}
+
+function SettingsModalShortInput({
+  configKey,
+  value,
+  onChange,
+  label,
+}: {
+  configKey: SettKey;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  value: any;
+  onChange: (value: string) => void;
+  label?: string;
+}) {
+  const helpMsg = CONFIG_INFO[configKey];
+
+  return (
+    <>
+      {/* on mobile, we simply show the help message here */}
+      {helpMsg && (
+        <div className="block mb-1 opacity-75">
+          <p className="text-xs">{helpMsg}</p>
+        </div>
+      )}
+      <label className="input input-bordered join-item grow flex items-center gap-2 mb-2">
+        <div className="dropdown dropdown-hover">
+          <div tabIndex={0} role="button" className="font-bold hidden md:block">
+            {label || configKey}
+          </div>
+        </div>
+        <input
+          type="text"
+          className="grow"
+          placeholder={`Default: ${CONFIG_DEFAULT[configKey] || 'none'}`}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      </label>
+    </>
+  );
+}
+
+function SettingsModalCheckbox({
+  configKey,
+  value,
+  onChange,
+  label,
+}: {
+  configKey: SettKey;
+  value: boolean;
+  onChange: (value: boolean) => void;
+  label: string;
+}) {
+  return (
+    <div className="flex flex-row items-center mb-2">
+      <input
+        type="checkbox"
+        className="toggle"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="ml-4">{label || configKey}</span>
+    </div>
+  );
+}
+
+# Sidebar.tsx
+-----
+import { useEffect, useMemo, useState } from 'react';
+import { classNames } from '../utils/misc';
+import { Conversation } from '../utils/types';
+import StorageUtils from '../utils/storage';
+import { useNavigate, useParams } from 'react-router';
+import {
+  ArrowDownTrayIcon,
+  EllipsisVerticalIcon,
+  PencilIcon,
+  PencilSquareIcon,
+  TrashIcon,
+  XMarkIcon,
+} from '@heroicons/react/24/outline';
+import { BtnWithTooltips } from '../utils/common';
+import { useAppContext } from '../utils/app.context';
+import toast from 'react-hot-toast';
+import { useModals } from './ModalProvider';
+
+export default function Sidebar() {
+  const params = useParams();
+  const navigate = useNavigate();
+
+  const { isGenerating } = useAppContext();
+
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [currConv, setCurrConv] = useState<Conversation | null>(null);
+
+  useEffect(() => {
+    StorageUtils.getOneConversation(params.convId ?? '').then(setCurrConv);
+  }, [params.convId]);
+
+  useEffect(() => {
+    const handleConversationChange = async () => {
+      setConversations(await StorageUtils.getAllConversations());
+    };
+    StorageUtils.onConversationChanged(handleConversationChange);
+    handleConversationChange();
+    return () => {
+      StorageUtils.offConversationChanged(handleConversationChange);
+    };
+  }, []);
+  const { showConfirm, showPrompt } = useModals();
+
+  const groupedConv = useMemo(
+    () => groupConversationsByDate(conversations),
+    [conversations]
+  );
+
+  return (
+    <>
+      <input
+        id="toggle-drawer"
+        type="checkbox"
+        className="drawer-toggle"
+        aria-label="Toggle sidebar"
+        defaultChecked
+      />
+
+      <div
+        className="drawer-side h-screen lg:h-screen z-50 lg:max-w-64"
+        role="complementary"
+        aria-label="Sidebar"
+        tabIndex={0}
+      >
+        <label
+          htmlFor="toggle-drawer"
+          aria-label="Close sidebar"
+          className="drawer-overlay"
+        ></label>
+
+        <a
+          href="#main-scroll"
+          className="absolute -left-80 top-0 w-1 h-1 overflow-hidden"
+        >
+          Skip to main content
+        </a>
+
+        <div className="flex flex-col bg-base-200 min-h-full max-w-64 py-4 px-4">
+          <div className="flex flex-row items-center justify-between mb-4 mt-4">
+            <h2 className="font-bold ml-4" role="heading">
+              Conversations
+            </h2>
+
+            {/* close sidebar button */}
+            <label
+              htmlFor="toggle-drawer"
+              className="btn btn-ghost lg:hidden"
+              aria-label="Close sidebar"
+              role="button"
+              tabIndex={0}
+            >
+              <XMarkIcon className="w-5 h-5" />
+            </label>
+          </div>
+
+          {/* new conversation button */}
+          <button
+            className={classNames({
+              'btn btn-ghost justify-start px-2': true,
+              'btn-soft': !currConv,
+            })}
+            onClick={() => navigate('/')}
+            aria-label="New conversation"
+          >
+            <PencilSquareIcon className="w-5 h-5" />
+            New conversation
+          </button>
+
+          {/* list of conversations */}
+          {groupedConv.map((group, i) => (
+            <div key={i} role="group">
+              {/* group name (by date) */}
+              {group.title ? (
+                // we use btn class here to make sure that the padding/margin are aligned with the other items
+                <b
+                  className="btn btn-ghost btn-xs bg-none btn-disabled block text-xs text-base-content text-start px-2 mb-0 mt-6 font-bold"
+                  role="note"
+                  aria-description={group.title}
+                  tabIndex={0}
+                >
+                  {group.title}
+                </b>
+              ) : (
+                <div className="h-2" />
+              )}
+
+              {group.conversations.map((conv) => (
+                <ConversationItem
+                  key={conv.id}
+                  conv={conv}
+                  isCurrConv={currConv?.id === conv.id}
+                  onSelect={() => {
+                    navigate(`/chat/${conv.id}`);
+                  }}
+                  onDelete={async () => {
+                    if (isGenerating(conv.id)) {
+                      toast.error(
+                        'Cannot delete conversation while generating'
+                      );
+                      return;
+                    }
+                    if (
+                      await showConfirm(
+                        'Are you sure to delete this conversation?'
+                      )
+                    ) {
+                      toast.success('Conversation deleted');
+                      StorageUtils.remove(conv.id);
+                      navigate('/');
+                    }
+                  }}
+                  onDownload={() => {
+                    if (isGenerating(conv.id)) {
+                      toast.error(
+                        'Cannot download conversation while generating'
+                      );
+                      return;
+                    }
+                    const conversationJson = JSON.stringify(conv, null, 2);
+                    const blob = new Blob([conversationJson], {
+                      type: 'application/json',
+                    });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `conversation_${conv.id}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                  }}
+                  onRename={async () => {
+                    if (isGenerating(conv.id)) {
+                      toast.error(
+                        'Cannot rename conversation while generating'
+                      );
+                      return;
+                    }
+                    const newName = await showPrompt(
+                      'Enter new name for the conversation',
+                      conv.name
+                    );
+                    if (newName && newName.trim().length > 0) {
+                      StorageUtils.updateConversationName(conv.id, newName);
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          ))}
+          <div className="text-center text-xs opacity-40 mt-auto mx-4 pt-8">
+            Conversations are saved to browser's IndexedDB
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ConversationItem({
+  conv,
+  isCurrConv,
+  onSelect,
+  onDelete,
+  onDownload,
+  onRename,
+}: {
+  conv: Conversation;
+  isCurrConv: boolean;
+  onSelect: () => void;
+  onDelete: () => void;
+  onDownload: () => void;
+  onRename: () => void;
+}) {
+  return (
+    <div
+      role="menuitem"
+      tabIndex={0}
+      aria-label={conv.name}
+      className={classNames({
+        'group flex flex-row btn btn-ghost justify-start items-center font-normal px-2 h-9':
+          true,
+        'btn-soft': isCurrConv,
+      })}
+    >
+      <button
+        key={conv.id}
+        className="w-full overflow-hidden truncate text-start"
+        onClick={onSelect}
+        dir="auto"
+      >
+        {conv.name}
+      </button>
+      <div tabIndex={0} className="dropdown dropdown-end h-5">
+        <BtnWithTooltips
+          className="cursor-pointer opacity-100 md:opacity-0 group-hover:opacity-100"
+          onClick={() => {}}
+          tooltipsContent="More"
+        >
+          <EllipsisVerticalIcon className="w-5 h-5" />
+        </BtnWithTooltips>
+        {/* dropdown menu */}
+        <ul
+          aria-label="More options"
+          tabIndex={0}
+          className="dropdown-content menu bg-base-100 rounded-box z-[1] p-2 shadow"
+        >
+          <li onClick={onRename} tabIndex={0}>
+            <a>
+              <PencilIcon className="w-4 h-4" />
+              Rename
+            </a>
+          </li>
+          <li onClick={onDownload} tabIndex={0}>
+            <a>
+              <ArrowDownTrayIcon className="w-4 h-4" />
+              Download
+            </a>
+          </li>
+          <li className="text-error" onClick={onDelete} tabIndex={0}>
+            <a>
+              <TrashIcon className="w-4 h-4" />
+              Delete
+            </a>
+          </li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// Grouping helper (unchanged)
+export interface GroupedConversations {
+  title?: string;
+  conversations: Conversation[];
+}
+
+export function groupConversationsByDate(
+  conversations: Conversation[]
+): GroupedConversations[] {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  const sevenDaysAgo = new Date(today);
+  sevenDaysAgo.setDate(today.getDate() - 7);
+
+  const thirtyDaysAgo = new Date(today);
+  thirtyDaysAgo.setDate(today.getDate() - 30);
+
+  const groups: { [key: string]: Conversation[] } = {
+    Today: [],
+    'Previous 7 Days': [],
+    'Previous 30 Days': [],
+  };
+  const monthlyGroups: { [key: string]: Conversation[] } = {};
+
+  const sortedConversations = [...conversations].sort(
+    (a, b) => b.lastModified - a.lastModified
+  );
+
+  for (const conv of sortedConversations) {
+    const convDate = new Date(conv.lastModified);
+
+    if (convDate >= today) {
+      groups['Today'].push(conv);
+    } else if (convDate >= sevenDaysAgo) {
+      groups['Previous 7 Days'].push(conv);
+    } else if (convDate >= thirtyDaysAgo) {
+      groups['Previous 30 Days'].push(conv);
+    } else {
+      const monthName = convDate.toLocaleString('default', { month: 'long' });
+      const year = convDate.getFullYear();
+      const monthYearKey = `${monthName} ${year}`;
+      if (!monthlyGroups[monthYearKey]) {
+        monthlyGroups[monthYearKey] = [];
+      }
+      monthlyGroups[monthYearKey].push(conv);
+    }
+  }
+
+  const result: GroupedConversations[] = [];
+
+  if (groups['Today'].length > 0) {
+    result.push({
+      title: undefined,
+      conversations: groups['Today'],
+    });
+  }
+
+  if (groups['Previous 7 Days'].length > 0) {
+    result.push({
+      title: 'Previous 7 Days',
+      conversations: groups['Previous 7 Days'],
+    });
+  }
+
+  if (groups['Previous 30 Days'].length > 0) {
+    result.push({
+      title: 'Previous 30 Days',
+      conversations: groups['Previous 30 Days'],
+    });
+  }
+
+  const sortedMonthKeys = Object.keys(monthlyGroups).sort((a, b) => {
+    const dateA = new Date(a);
+    const dateB = new Date(b);
+    return dateB.getTime() - dateA.getTime();
+  });
+
+  for (const monthKey of sortedMonthKeys) {
+    if (monthlyGroups[monthKey].length > 0) {
+      result.push({ title: monthKey, conversations: monthlyGroups[monthKey] });
+    }
+  }
+
+  return result;
+}
+
+# useChatExtraContext.tsx
+-----
+import { useState } from 'react';
+import { MessageExtra } from '../utils/types';
+import toast from 'react-hot-toast';
+import { useAppContext } from '../utils/app.context';
+import * as pdfjs from 'pdfjs-dist';
+import pdfjsWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { TextContent, TextItem } from 'pdfjs-dist/types/src/display/api';
+
+pdfjs.GlobalWorkerOptions.workerSrc = pdfjsWorkerSrc;
+
+// This file handles uploading extra context items (a.k.a files)
+// It allows processing these kinds of files:
+// - image files (converted to base64)
+// - audio files (converted to base64)
+// - text files (including code files)
+// - pdf (converted to text)
+
+// Interface describing the API returned by the hook
+export interface ChatExtraContextApi {
+  items?: MessageExtra[]; // undefined if empty, similar to Message['extra']
+  addItems: (items: MessageExtra[]) => void;
+  removeItem: (idx: number) => void;
+  clearItems: () => void;
+  onFileAdded: (files: File[]) => void; // used by "upload" button
+}
+
+export function useChatExtraContext(): ChatExtraContextApi {
+  const { serverProps, config } = useAppContext();
+  const [items, setItems] = useState<MessageExtra[]>([]);
+
+  const addItems = (newItems: MessageExtra[]) => {
+    setItems((prev) => [...prev, ...newItems]);
+  };
+
+  const removeItem = (idx: number) => {
+    setItems((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const clearItems = () => {
+    setItems([]);
+  };
+
+  const isSupportVision = serverProps?.modalities?.vision;
+
+  const onFileAdded = async (files: File[]) => {
+    try {
+      for (const file of files) {
+        const mimeType = file.type;
+
+        // this limit is only to prevent accidental uploads of huge files
+        // it can potentially crashes the browser because we read the file as base64
+        if (file.size > 500 * 1024 * 1024) {
+          toast.error('File is too large. Maximum size is 500MB.');
+          break;
+        }
+
+        if (mimeType.startsWith('image/')) {
+          if (!isSupportVision) {
+            toast.error('Multimodal is not supported by this server or model.');
+            break;
+          }
+
+          let base64Url = await getFileAsBase64(file);
+          if (mimeType === 'image/svg+xml') {
+            // Convert SVG to PNG
+            base64Url = await svgBase64UrlToPngDataURL(base64Url);
+          }
+          addItems([
+            {
+              type: 'imageFile',
+              name: file.name,
+              base64Url,
+            },
+          ]);
+        } else if (mimeType.startsWith('video/')) {
+          toast.error('Video files are not supported yet.');
+          break;
+        } else if (mimeType.startsWith('audio/')) {
+          if (!/mpeg|wav/.test(mimeType)) {
+            toast.error('Only mp3 and wav audio files are supported.');
+            break;
+          }
+
+          // plain base64, not a data URL
+          const base64Data = await getFileAsBase64(file, false);
+          addItems([
+            {
+              type: 'audioFile',
+              name: file.name,
+              mimeType,
+              base64Data,
+            },
+          ]);
+        } else if (mimeType.startsWith('application/pdf')) {
+          if (config.pdfAsImage && !isSupportVision) {
+            toast(
+              'Multimodal is not supported, PDF will be converted to text instead of image.'
+            );
+            break;
+          }
+
+          if (config.pdfAsImage && isSupportVision) {
+            // Convert PDF to images
+            const base64Urls = await convertPDFToImage(file);
+            addItems(
+              base64Urls.map((base64Url) => ({
+                type: 'imageFile',
+                name: file.name,
+                base64Url,
+              }))
+            );
+          } else {
+            // Convert PDF to text
+            const content = await convertPDFToText(file);
+            addItems([
+              {
+                type: 'textFile',
+                name: file.name,
+                content,
+              },
+            ]);
+            if (isSupportVision) {
+              toast.success(
+                'PDF file converted to text. You can also convert it to image, see in Settings.'
+              );
+            }
+          }
+          break;
+        } else {
+          // Because there can be many text file types (like code file), we will not check the mime type
+          // and will just check if the file is not binary.
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            if (event.target?.result) {
+              const content = event.target.result as string;
+              if (!isLikelyNotBinary(content)) {
+                toast.error('File is binary. Please upload a text file.');
+                return;
+              }
+              addItems([
+                {
+                  type: 'textFile',
+                  name: file.name,
+                  content,
+                },
+              ]);
+            }
+          };
+          reader.readAsText(file);
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errorMessage = `Error processing file: ${message}`;
+      toast.error(errorMessage);
+    }
+  };
+
+  return {
+    items: items.length > 0 ? items : undefined,
+    addItems,
+    removeItem,
+    clearItems,
+    onFileAdded,
+  };
+}
+
+async function getFileAsBase64(file: File, outputUrl = true): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      if (event.target?.result) {
+        let result = event.target.result as string;
+        if (!outputUrl) {
+          // remove base64 url prefix and correct characters
+          result = result.substring(result.indexOf(',') + 1);
+        }
+        resolve(result);
+      } else {
+        reject(new Error('Failed to read file.'));
+      }
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function getFileAsBuffer(file: File): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      if (event.target?.result) {
+        resolve(event.target.result as ArrayBuffer);
+      } else {
+        reject(new Error('Failed to read file.'));
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+async function convertPDFToText(file: File): Promise<string> {
+  const buffer = await getFileAsBuffer(file);
+  const pdf = await pdfjs.getDocument(buffer).promise;
+  const numPages = pdf.numPages;
+  const textContentPromises: Promise<TextContent>[] = [];
+  for (let i = 1; i <= numPages; i++) {
+    textContentPromises.push(
+      pdf.getPage(i).then((page) => page.getTextContent())
+    );
+  }
+  const textContents = await Promise.all(textContentPromises);
+  const textItems = textContents.flatMap((textContent: TextContent) =>
+    textContent.items.map((item) => (item as TextItem).str ?? '')
+  );
+  return textItems.join('\n');
+}
+
+// returns list of base64 images
+async function convertPDFToImage(file: File): Promise<string[]> {
+  const buffer = await getFileAsBuffer(file);
+  const doc = await pdfjs.getDocument(buffer).promise;
+  const pages: Promise<string>[] = [];
+
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const viewport = page.getViewport({ scale: 1.5 });
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    if (!ctx) {
+      throw new Error('Failed to get 2D context from canvas');
+    }
+    const task = page.render({ canvasContext: ctx, viewport: viewport });
+    pages.push(
+      task.promise.then(() => {
+        return canvas.toDataURL();
+      })
+    );
+  }
+
+  return await Promise.all(pages);
+}
+
+// WARN: vibe code below
+// This code is a heuristic to determine if a string is likely not binary.
+// It is necessary because input file can have various mime types which we don't have time to investigate.
+// For example, a python file can be text/plain, application/x-python, etc.
+function isLikelyNotBinary(str: string): boolean {
+  const options = {
+    prefixLength: 1024 * 10, // Check the first 10KB of the string
+    suspiciousCharThresholdRatio: 0.15, // Allow up to 15% suspicious chars
+    maxAbsoluteNullBytes: 2,
+  };
+
+  if (!str) {
+    return true; // Empty string is considered "not binary" or trivially text.
+  }
+
+  const sampleLength = Math.min(str.length, options.prefixLength);
+  if (sampleLength === 0) {
+    return true; // Effectively an empty string after considering prefixLength.
+  }
+
+  let suspiciousCharCount = 0;
+  let nullByteCount = 0;
+
+  for (let i = 0; i < sampleLength; i++) {
+    const charCode = str.charCodeAt(i);
+
+    // 1. Check for Unicode Replacement Character (U+FFFD)
+    // This is a strong indicator if the string was created from decoding bytes as UTF-8.
+    if (charCode === 0xfffd) {
+      suspiciousCharCount++;
+      continue;
+    }
+
+    // 2. Check for Null Bytes (U+0000)
+    if (charCode === 0x0000) {
+      nullByteCount++;
+      // We also count nulls towards the general suspicious character count,
+      // as they are less common in typical text files.
+      suspiciousCharCount++;
+      continue;
+    }
+
+    // 3. Check for C0 Control Characters (U+0001 to U+001F)
+    // Exclude common text control characters: TAB (9), LF (10), CR (13).
+    // We can also be a bit lenient with BEL (7) and BS (8) which sometimes appear in logs.
+    if (charCode < 32) {
+      if (
+        charCode !== 9 && // TAB
+        charCode !== 10 && // LF
+        charCode !== 13 && // CR
+        charCode !== 7 && // BEL (Bell) - sometimes in logs
+        charCode !== 8 // BS (Backspace) - less common, but possible
+      ) {
+        suspiciousCharCount++;
+      }
+    }
+    // Characters from 32 (space) up to 126 (~) are printable ASCII.
+    // Characters 127 (DEL) is a control character.
+    // Characters >= 128 are extended ASCII / multi-byte Unicode.
+    // If they resulted in U+FFFD, we caught it. Otherwise, they are valid
+    // (though perhaps unusual) Unicode characters from JS's perspective.
+    // The main concern is if those higher characters came from misinterpreting
+    // a single-byte encoding as UTF-8, which again, U+FFFD would usually flag.
+  }
+
+  // Check absolute null byte count
+  if (nullByteCount > options.maxAbsoluteNullBytes) {
+    return false; // Too many null bytes is a strong binary indicator
+  }
+
+  // Check ratio of suspicious characters
+  const ratio = suspiciousCharCount / sampleLength;
+  return ratio <= options.suspiciousCharThresholdRatio;
+}
+
+// WARN: vibe code below
+// Converts a Base64URL encoded SVG string to a PNG Data URL using browser Canvas API.
+function svgBase64UrlToPngDataURL(base64UrlSvg: string): Promise<string> {
+  const backgroundColor = 'white'; // Default background color for PNG
+
+  return new Promise((resolve, reject) => {
+    try {
+      const img = new Image();
+
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+
+        if (!ctx) {
+          reject(new Error('Failed to get 2D canvas context.'));
+          return;
+        }
+
+        // Use provided dimensions or SVG's natural dimensions, with fallbacks
+        // Fallbacks (e.g., 300x300) are for SVGs without explicit width/height
+        // or when naturalWidth/Height might be 0 before full processing.
+        const targetWidth = img.naturalWidth || 300;
+        const targetHeight = img.naturalHeight || 300;
+
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+
+        if (backgroundColor) {
+          ctx.fillStyle = backgroundColor;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+        resolve(canvas.toDataURL('image/png'));
+      };
+
+      img.onerror = () => {
+        reject(
+          new Error('Failed to load SVG image. Ensure the SVG data is valid.')
+        );
+      };
+
+      // Load SVG string into an Image element
+      img.src = base64UrlSvg;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errorMessage = `Error converting SVG to PNG: ${message}`;
+      toast.error(errorMessage);
+      reject(new Error(errorMessage));
+    }
+  });
+}
+
+# useChatScroll.tsx
+-----
+import React, { useEffect } from 'react';
+import { throttle } from '../utils/misc';
+
+export const scrollToBottom = (requiresNearBottom: boolean, delay?: number) => {
+  const mainScrollElem = document.getElementById('main-scroll');
+  if (!mainScrollElem) return;
+  const spaceToBottom =
+    mainScrollElem.scrollHeight -
+    mainScrollElem.scrollTop -
+    mainScrollElem.clientHeight;
+  if (!requiresNearBottom || spaceToBottom < 100) {
+    setTimeout(
+      () => mainScrollElem.scrollTo({ top: mainScrollElem.scrollHeight }),
+      delay ?? 80
+    );
+  }
+};
+
+const scrollToBottomThrottled = throttle(scrollToBottom, 80);
+
+export function useChatScroll(msgListRef: React.RefObject<HTMLDivElement>) {
+  useEffect(() => {
+    if (!msgListRef.current) return;
+
+    const resizeObserver = new ResizeObserver((_) => {
+      scrollToBottomThrottled(true, 10);
+    });
+
+    resizeObserver.observe(msgListRef.current);
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [msgListRef]);
+}
+
+# useChatTextarea.ts
+-----
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { throttle } from '../utils/misc';
+
+// Media Query for detecting "large" screens (matching Tailwind's lg: breakpoint)
+const LARGE_SCREEN_MQ = '(min-width: 1024px)';
+
+// Calculates and sets the textarea height based on its scrollHeight
+const adjustTextareaHeight = throttle(
+  (textarea: HTMLTextAreaElement | null) => {
+    if (!textarea) return;
+
+    // Only perform auto-sizing on large screens
+    if (!window.matchMedia(LARGE_SCREEN_MQ).matches) {
+      // On small screens, reset inline height and max-height styles.
+      // This allows CSS (e.g., `rows` attribute or classes) to control the height,
+      // and enables manual resizing if `resize-vertical` is set.
+      textarea.style.height = ''; // Use 'auto' or '' to reset
+      textarea.style.maxHeight = '';
+      return; // Do not adjust height programmatically on small screens
+    }
+
+    const computedStyle = window.getComputedStyle(textarea);
+    // Get the max-height specified by CSS (e.g., from `lg:max-h-48`)
+    const currentMaxHeight = computedStyle.maxHeight;
+
+    // Temporarily remove max-height to allow scrollHeight to be calculated correctly
+    textarea.style.maxHeight = 'none';
+    // Reset height to 'auto' to measure the actual scrollHeight needed
+    textarea.style.height = 'auto';
+    // Set the height to the calculated scrollHeight
+    textarea.style.height = `${textarea.scrollHeight}px`;
+    // Re-apply the original max-height from CSS to enforce the limit
+    textarea.style.maxHeight = currentMaxHeight;
+  },
+  100
+); // Throttle to prevent excessive calls
+
+// Interface describing the API returned by the hook
+export interface ChatTextareaApi {
+  value: () => string;
+  setValue: (value: string) => void;
+  focus: () => void;
+  ref: React.RefObject<HTMLTextAreaElement>;
+  refOnSubmit: React.MutableRefObject<(() => void) | null>; // Submit handler
+  onInput: (event: React.FormEvent<HTMLTextAreaElement>) => void; // Input handler
+}
+
+// This is a workaround to prevent the textarea from re-rendering when the inner content changes
+// See https://github.com/ggml-org/llama.cpp/pull/12299
+// combined now with auto-sizing logic.
+export function useChatTextarea(initValue: string): ChatTextareaApi {
+  const [savedInitValue, setSavedInitValue] = useState<string>(initValue);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const onSubmitRef = useRef<(() => void) | null>(null);
+
+  // Effect to set initial value and height on mount or when initValue changes
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      if (typeof savedInitValue === 'string' && savedInitValue.length > 0) {
+        textarea.value = savedInitValue;
+        // Call adjustTextareaHeight - it will check screen size internally
+        setTimeout(() => adjustTextareaHeight(textarea), 0);
+        setSavedInitValue(''); // Reset after applying
+      } else {
+        // Adjust height even if there's no initial value (for initial render)
+        setTimeout(() => adjustTextareaHeight(textarea), 0);
+      }
+    }
+  }, [textareaRef, savedInitValue]); // Depend on ref and savedInitValue
+
+  // On input change, we adjust the height of the textarea
+  const handleInput = useCallback(
+    (event: React.FormEvent<HTMLTextAreaElement>) => {
+      // Call adjustTextareaHeight on every input - it will decide whether to act
+      adjustTextareaHeight(event.currentTarget);
+    },
+    []
+  );
+
+  return {
+    // Method to get the current value directly from the textarea
+    value: () => {
+      return textareaRef.current?.value ?? '';
+    },
+    // Method to programmatically set the value and trigger height adjustment
+    setValue: (value: string) => {
+      const textarea = textareaRef.current;
+      if (textarea) {
+        textarea.value = value;
+        // Call adjustTextareaHeight - it will check screen size internally
+        setTimeout(() => adjustTextareaHeight(textarea), 0);
+      }
+    },
+    focus: () => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+      }
+    },
+    ref: textareaRef,
+    refOnSubmit: onSubmitRef,
+    onInput: handleInput, // for adjusting height on input
+  };
+}
+

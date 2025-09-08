@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  concatdir.sh [-i ext1,ext2,... | -e ext1,ext2,...] SRC_DIR OUT_FILE
+  concatdir.sh -h
+
+Concatenate files in SRC_DIR (non-destructively) into OUT_FILE.
+Each file is preceded by:
+  # <filename>
+  -----
+
+Options:
+  -i list   Include ONLY these extensions (comma or space separated). Case-insensitive.
+  -e list   EXCLUDE these extensions (comma or space separated). Case-insensitive.
+  -h        Show this help.
+
+Defaults:
+  • If no SRC_DIR/OUT_FILE are provided, uses the current directory as SRC_DIR.
+    OUT_FILE will be <dirname>.txt inside that directory.
+  • Example: running in ~/workspace/wgpt/webui → output is webui.txt
+EOF
+}
+
+inc_list=""
+exc_list=""
+
+# Parse flags before positionals
+while getopts ":i:e:h" opt; do
+  case "$opt" in
+    i) inc_list="$OPTARG" ;;
+    e) exc_list="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    \?) echo "Unknown option: -$OPTARG" >&2; usage; exit 2 ;;
+    :)  echo "Option -$OPTARG requires an argument." >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND-1))
+
+# Defaults if no args (still honors -i/-e)
+if [[ $# -eq 0 ]]; then
+  SRC_DIR="$(pwd)"
+  DIRNAME="$(basename "$SRC_DIR")"
+  OUT_FILE="$SRC_DIR/$DIRNAME.txt"
+elif [[ $# -eq 2 ]]; then
+  SRC_DIR=$1
+  OUT_FILE=$2
+else
+  echo "Error: need 0 or 2 args (SRC_DIR OUT_FILE)." >&2
+  usage
+  exit 2
+fi
+
+if [[ -n "$inc_list" && -n "$exc_list" ]]; then
+  echo "Error: use either -i or -e, not both." >&2
+  exit 2
+fi
+
+if [[ ! -d "$SRC_DIR" ]]; then
+  echo "Error: SRC_DIR not found: $SRC_DIR" >&2
+  exit 1
+fi
+
+# Ensure output dir exists
+mkdir -p -- "$(dirname -- "$OUT_FILE")"
+
+# Normalize extension lists
+normalize_exts() {
+  local raw="$1"
+  tr ', ' '\n\n' <<<"$raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sed 's/^\.*//' | awk 'NF'
+}
+mapfile -t INC_ARR < <(normalize_exts "${inc_list:-}")
+mapfile -t EXC_ARR < <(normalize_exts "${exc_list:-}")
+
+cd -- "$SRC_DIR"
+
+OUT_BASENAME=$(basename -- "$OUT_FILE")
+
+# Build find args (non-recursive)
+FIND_ARGS=( . -maxdepth 1 -type f ! -name "$OUT_BASENAME" )
+
+# Include filter
+if (( ${#INC_ARR[@]} > 0 )); then
+  FIND_ARGS+=( \( )
+  first=1
+  for ext in "${INC_ARR[@]}"; do
+    [[ -z "$ext" ]] && continue
+    if (( first )); then
+      FIND_ARGS+=( -iname "*.${ext}" )
+      first=0
+    else
+      FIND_ARGS+=( -o -iname "*.${ext}" )
+    fi
+  done
+  FIND_ARGS+=( \) )
+fi
+
+# Exclude filter
+if (( ${#EXC_ARR[@]} > 0 )); then
+  FIND_ARGS+=( ! \( )
+  first=1
+  for ext in "${EXC_ARR[@]}"; do
+    [[ -z "$ext" ]] && continue
+    if (( first )); then
+      FIND_ARGS+=( -iname "*.${ext}" )
+      first=0
+    else
+      FIND_ARGS+=( -o -iname "*.${ext}" )
+    fi
+  done
+  FIND_ARGS+=( \) )
+fi
+
+# Create temp output OUTSIDE the source dir to avoid re-inclusion
+tmp_out="$(mktemp -p "${TMPDIR:-/tmp}" "concatdir.${OUT_BASENAME}.XXXXXX")"
+trap 'rm -f -- "$tmp_out"' EXIT
+
+# Concatenate in deterministic order with safe NUL delimiters
+LC_ALL=C find "${FIND_ARGS[@]}" -print0 \
+| sort -z \
+| while IFS= read -r -d '' f; do
+    base="$(basename -- "$f")"
+    printf '# %s\n-----\n' "$base"
+    cat -- "$f"
+    printf '\n'
+  done > "$tmp_out"
+
+# Atomic move to target
+mv -f -- "$tmp_out" "$OUT_FILE"
+trap - EXIT
+
+echo "Wrote: $OUT_FILE"
